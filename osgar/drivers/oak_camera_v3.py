@@ -83,12 +83,21 @@ class OakCamera:
             assert self.mono_resolution in g_resolution_dic, self.mono_resolution
             self.mono_resolution = g_resolution_dic[self.mono_resolution]
 
-        self.laser_projector_current = config.get("laser_projector_current")
-        if self.laser_projector_current is not None:
-            assert self.laser_projector_current <= 1200, self.laser_projector_current  # The limit is 1200 mA.
-        self.flood_light_current = config.get("flood_light_current")
-        if self.flood_light_current is not None:
-            assert self.flood_light_current <= 1500, self.flood_light_current  # The limit is 1500 mA.
+        # NOTE (v3 fix): device.setIrLaserDotProjectorIntensity()/setIrFloodLightIntensity()
+        # take a 0..1 intensity fraction in depthai v3, NOT mA (that was the v2
+        # setIrLaserDotProjectorBrightness(mA) API). Config keeps mA units for
+        # continuity with existing configs/intuition; we convert to a fraction
+        # of the hardware's rated max (1200mA laser / 1500mA flood) below.
+        laser_current_mA = config.get("laser_projector_current")
+        if laser_current_mA is not None:
+            assert 0 <= laser_current_mA <= 1200, laser_current_mA  # The limit is 1200 mA.
+        self.laser_projector_current = (
+            None if laser_current_mA is None else min(1.0, laser_current_mA / 1200))
+        flood_current_mA = config.get("flood_light_current")
+        if flood_current_mA is not None:
+            assert 0 <= flood_current_mA <= 1500, flood_current_mA  # The limit is 1500 mA.
+        self.flood_light_current = (
+            None if flood_current_mA is None else min(1.0, flood_current_mA / 1500))
 
         self.video_encoder = get_video_encoder(config.get('video_encoder', 'mjpeg'))
         self.video_encoder_h264_bitrate = config.get('h264_bitrate', 0)  # 0 = automatic
@@ -122,6 +131,67 @@ class OakCamera:
             self.median_filter = getattr(dai.MedianFilter, median_filter_value)
         else:
             self.median_filter = None
+
+        # explicit confidence threshold (0..255, lower = more accurate/less fill);
+        # overrides whatever the depth_profile preset set, if both are given
+        self.confidence_threshold = config.get("stereo_confidence_threshold")
+        if self.confidence_threshold is not None:
+            assert 0 <= self.confidence_threshold <= 255, self.confidence_threshold
+
+        # speckle filter - removes small blobs of noisy disparity
+        self.speckle_filter = config.get("stereo_speckle_filter")  # True/False
+        self.speckle_range = config.get("stereo_speckle_range", 50)
+
+        # spatial filter - edge-preserving smoothing + hole fill
+        self.spatial_filter = config.get("stereo_spatial_filter")  # True/False
+        self.spatial_filter_alpha = config.get("stereo_spatial_filter_alpha", 0.5)
+        self.spatial_filter_delta = config.get("stereo_spatial_filter_delta", 8)
+        self.spatial_filter_hole_filling_radius = config.get("stereo_spatial_filter_hole_filling_radius", 2)
+        self.spatial_filter_num_iterations = config.get("stereo_spatial_filter_num_iterations", 1)
+
+        # temporal filter - persistency across frames; CAUTION: intended for
+        # static scenes, can smear/blur depth for a moving robot - off by default
+        self.temporal_filter = config.get("stereo_temporal_filter")  # True/False
+
+        # brightness filter - invalidate over/under-exposed pixels (helps with
+        # rectification-edge artifacts); defaults of 0/255 filter nothing, tune
+        # to your actual mono exposure histogram
+        self.brightness_filter = config.get("stereo_brightness_filter")  # True/False
+        self.brightness_filter_min = config.get("stereo_brightness_filter_min", 0)
+        self.brightness_filter_max = config.get("stereo_brightness_filter_max", 255)
+
+        # threshold filter - clip to the robot's actually-relevant depth range, in mm
+        self.threshold_filter_min_mm = config.get("stereo_threshold_filter_min_mm")
+        self.threshold_filter_max_mm = config.get("stereo_threshold_filter_max_mm")
+
+        # SIPP (Signal Image Processing Pipeline) memory pool - shared on-chip
+        # buffer used by ISP, mono-camera Warp/rectification, AND the stereo
+        # median filter. Bump this if you hit "'Median' out of system
+        # resources" / "Invalid StereoDepth config, error 525" - that error is
+        # this pool running out, not something wrong with the filter itself.
+        # Per Luxonis docs: 0 moves the pool from the (tiny) on-chip CMX
+        # memory into DDR instead, at a fixed 256KB - usually the easiest fix
+        # since CMX is small and shared with everything else on the chip.
+        self.sipp_buffer_size = config.get("sipp_buffer_size")
+        self.sipp_dma_buffer_size = config.get("sipp_dma_buffer_size")
+
+        # Shaves + CMX memory slices reserved specifically for the StereoDepth
+        # postprocessing chain (median/speckle/spatial/etc). This is a SEPARATE
+        # resource pool from sipp_buffer_size above (that one is shared with
+        # ISP/Warp too). Per Luxonis docs, THIS is the documented fix for
+        # "'Median' out of system resources" / shave-allocation OOM errors when
+        # enabling more than one postprocessing filter at once:
+        # https://docs.luxonis.com/hardware/platform/depth/configuring-stereo-depth
+        #   "If the pipeline complains about shave/memory allocation, try
+        #    increasing the HW resources used in postprocessing with
+        #    setPostProcessingHardwareResources(n_shaves, n_cmx)."
+        # Start with (3, 3) and increase if the error persists; note this
+        # competes for the same limited on-chip shaves/CMX as the NN model
+        # running on the color camera, so raising it may require lowering
+        # numShaves on the NN side too.
+        self.postprocessing_shaves = config.get("stereo_postprocessing_shaves")
+        self.postprocessing_cmx = config.get("stereo_postprocessing_cmx")
+
         self.set_rectify_edge_fill_color = config.get("set_rectify_edge_fill_color")  # 0 for black color
         self.enable_distortion_correction = config.get("enable_distortion_correction")  # True or False
         self.set_left_right_check_threshold = config.get("set_left_right_check_threshold")
@@ -198,6 +268,11 @@ class OakCamera:
             pipeline_ctx = dai.Pipeline()
 
         with pipeline_ctx as pipeline:
+            if self.sipp_buffer_size is not None:
+                pipeline.setSippBufferSize(self.sipp_buffer_size)
+            if self.sipp_dma_buffer_size is not None:
+                pipeline.setSippDmaBufferSize(self.sipp_dma_buffer_size)
+
             # Define source and output
             if self.is_color:
                 cam_rgb = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
@@ -296,6 +371,32 @@ class OakCamera:
                     stereo.setSubpixel(self.is_subpixel)
                 if self.median_filter is not None:
                     stereo.initialConfig.setMedianFilter(self.median_filter)
+                if self.confidence_threshold is not None:
+                    stereo.initialConfig.setConfidenceThreshold(self.confidence_threshold)
+                if self.speckle_filter is not None:
+                    stereo.initialConfig.postProcessing.speckleFilter.enable = self.speckle_filter
+                    stereo.initialConfig.postProcessing.speckleFilter.speckleRange = self.speckle_range
+                if self.spatial_filter is not None:
+                    stereo.initialConfig.postProcessing.spatialFilter.enable = self.spatial_filter
+                    stereo.initialConfig.postProcessing.spatialFilter.alpha = self.spatial_filter_alpha
+                    stereo.initialConfig.postProcessing.spatialFilter.delta = self.spatial_filter_delta
+                    stereo.initialConfig.postProcessing.spatialFilter.holeFillingRadius = self.spatial_filter_hole_filling_radius
+                    stereo.initialConfig.postProcessing.spatialFilter.numIterations = self.spatial_filter_num_iterations
+                if self.temporal_filter is not None:
+                    stereo.initialConfig.postProcessing.temporalFilter.enable = self.temporal_filter
+                if self.threshold_filter_min_mm is not None:
+                    stereo.initialConfig.postProcessing.thresholdFilter.minRange = self.threshold_filter_min_mm
+                if self.threshold_filter_max_mm is not None:
+                    stereo.initialConfig.postProcessing.thresholdFilter.maxRange = self.threshold_filter_max_mm
+                if self.brightness_filter:
+                    # Note: BrightnessFilter has no separate enable flag - it's
+                    # always "active", so leaving min/max at their 0/255
+                    # defaults is what makes it a no-op. Setting real values
+                    # here is what "enables" it in practice.
+                    stereo.initialConfig.postProcessing.brightnessFilter.minBrightness = self.brightness_filter_min
+                    stereo.initialConfig.postProcessing.brightnessFilter.maxBrightness = self.brightness_filter_max
+                if self.postprocessing_shaves is not None and self.postprocessing_cmx is not None:
+                    stereo.setPostProcessingHardwareResources(self.postprocessing_shaves, self.postprocessing_cmx)
                 if self.set_rectify_edge_fill_color is not None:
                     stereo.setRectifyEdgeFillColor(self.set_rectify_edge_fill_color)  # was 0
                 if self.enable_distortion_correction is not None:
