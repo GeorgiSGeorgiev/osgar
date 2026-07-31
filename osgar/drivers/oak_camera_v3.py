@@ -515,6 +515,7 @@ class OakCamera:
                 pipeline.getDefaultDevice().setIrFloodLightIntensity(self.flood_light_current)
 
             qr_detector = cv2.QRCodeDetector() if self.is_qr_detection else None
+            last_qr_text = None  # dedup - a code sitting in view decodes on every frame
 
             while pipeline.isRunning() and self.bus.is_alive():
                 processed_any = False
@@ -620,8 +621,16 @@ class OakCamera:
                         frame = qr_frames[-1].getCvFrame()
                         text, points, _ = qr_detector.detectAndDecode(frame)
                         if text:
-                            print('QR code decoded:', text)
-                            self.bus.publish('qr_code', text)
+                            if text != last_qr_text:
+                                # a code sitting in view decodes fresh every
+                                # frame (fps times/sec) - only publish on
+                                # actual change, not every re-decode of the
+                                # same still-visible code
+                                print('QR code decoded:', text)
+                                self.bus.publish('qr_code', text)
+                                last_qr_text = text
+                        else:
+                            last_qr_text = None  # code left view - a later re-appearance re-announces
 
                 # Only rest the CPU if no frames were pulled in this tick loop
                 if not processed_any:
