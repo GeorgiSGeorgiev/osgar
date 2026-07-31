@@ -63,6 +63,69 @@
   If pitch ever pushes a window past the top/bottom of the frame, it
   is clamped to stay in-bounds rather than shrinking or wrapping.
 
+  --- Fixed camera-to-chassis mount tilt (camera_tilt_deg) ---
+
+  The pitch-compensation above only tracks CHANGES in chassis pitch
+  reported by the IMU at runtime (ramps, bumps) - it starts from
+  `rows`/`ground_rows` as given, implicitly assuming the camera looks
+  perfectly horizontal when the chassis itself reads 0 pitch. If the
+  camera is physically mounted at a fixed upward (or downward) angle
+  relative to the chassis, that assumption is wrong even on flat
+  ground with the chassis level, and `rows`/`ground_rows` need to
+  already be positioned for that permanent tilt.
+
+  Concretely: for a level camera, the horizon sits at exactly the
+  vertical center of the frame (img_height/2), regardless of mount
+  height. Tilting the camera up by camera_tilt_deg moves the horizon
+  DOWN (toward larger row numbers) by camera_tilt_deg worth of pixels
+  - so a `rows` window whose top edge was chosen assuming a level
+  camera can end up straddling the horizon once the real fixed tilt is
+  accounted for, and a window that's up in the sky/far background most
+  of the time reads mostly-invalid -> falls back to the centre zone's
+  0.0 fail-safe ("assume the worst") -> the robot reads a permanent
+  false "obstacle" immediately ahead and won't drive. If you see this
+  (obstacle_zones center pinned near 0 with nothing actually in front
+  of the robot), check camera_tilt_deg and the `rows` top edge first.
+
+  camera_tilt_deg (default 0, degrees, positive = tilted up) is applied
+  as an ADDITIONAL shift on top of the dynamic IMU-pitch shift above,
+  every frame, unconditionally (it's a fixed mechanical fact, not
+  something that needs the smoothing/threshold/clamp logic that exists
+  to filter noisy or bump-transient IMU readings). Unlike
+  pitch_shift_sign, its sign does NOT need field calibration/flipping:
+  "tilt up moves the window down" falls directly out of standard image
+  projection geometry (row 0 = top, increasing downward - true for
+  every image library involved here), not out of the IMU's own,
+  otherwise-unverified sign convention. Still worth a sanity check
+  against a real depth viewer once you can - the shift MAGNITUDE also
+  depends on vertical_fov_deg being right for your camera variant.
+
+  Because `rows`/`ground_rows` given in config are now expected to
+  represent the level-camera baseline (with camera_tilt_deg making up
+  the difference at runtime), if your existing values were already
+  hand-tuned by eye against the real (already-tilted) camera, applying
+  a nonzero camera_tilt_deg on top will shift them further than before
+  - re-verify against a depth viewer rather than assuming old numbers
+  still apply unchanged.
+
+  --- Startup: robot powers on already tilted ---
+
+  self.smoothed_pitch (the EMA of dynamic IMU pitch, see above) starts
+  at 0 and only snaps to the very first 'rotation' reading it gets,
+  after which it settles normally via the slow EMA (pitch_smoothing_
+  alpha is deliberately slow - around a 1-2s time constant at typical
+  depth fps - specifically so a single bump/jolt can't yank the window
+  around). Without that snap, if the chassis happens to already be
+  pitched at power-on (resting on a ramp, one side on a curb, etc.),
+  the window would start from the WRONG (level-assumed) position and
+  only ease into the correct one over the next several seconds - i.e.
+  exactly the same false-"obstacle"-immediately-ahead failure mode
+  described above for camera_tilt_deg, just transient instead of
+  permanent, and easy to misdiagnose as a camera_tilt_deg problem since
+  it looks the same from the printed line. The snap only fixes the
+  startup transient; camera_tilt_deg above is still required for the
+  permanent fixed-mount component even after it settles.
+
   --- Ground / drop-off (staircase, ledge) check ---
 
   Same depth frame, opposite polarity: a dedicated ground_rows/
@@ -134,8 +197,10 @@ class ObstacleDetector3DZones(Node):
         self.pitch_shift_sign = config.get('pitch_shift_sign', 1)
         self.pitch_smoothing_alpha = config.get('pitch_smoothing_alpha', 0.05)
         self.min_shift_change_px = config.get('min_shift_change_px', 12)
+        self.camera_tilt_deg = config.get('camera_tilt_deg', 0)  # fixed mount tilt, see docstring
         self.pitch = 0.0            # radians, latest raw sample from 'rotation'
         self.smoothed_pitch = 0.0   # radians, EMA of the above
+        self._pitch_initialized = False  # see on_rotation - snap instead of EMA-ramp on the first reading
         self.applied_shift_px = 0.0
         self.rows = self.base_rows
 
@@ -150,6 +215,12 @@ class ObstacleDetector3DZones(Node):
         # platform publishes [9000 - yaw, -pitch, roll], all in centidegrees -
         # data[1] is -pitch, whatever sign convention the platform's IMU uses
         self.pitch = math.radians(data[1] / 100.0)
+        if not self._pitch_initialized:
+            # snap instead of letting the EMA ramp up from 0 - see
+            # "Startup: robot powers on already tilted" in the module
+            # docstring for why the slow EMA is exactly wrong here
+            self.smoothed_pitch = self.pitch
+            self._pitch_initialized = True
 
     def _shift_window(self, base_rows, shift_px, img_height):
         r0, r1 = base_rows
@@ -161,10 +232,24 @@ class ObstacleDetector3DZones(Node):
     def _maybe_update_rows(self, img_height):
         vfov_rad = math.radians(self.vertical_fov_deg)
         px_per_rad = img_height / vfov_rad
-        raw_shift_px = self.pitch_shift_sign * self.smoothed_pitch * px_per_rad
 
-        max_shift_px = math.radians(self.max_pitch_shift_deg) * px_per_rad
-        target_shift_px = max(-max_shift_px, min(max_shift_px, raw_shift_px))
+        # dynamic part: chassis pitch from the IMU (ramps, bumps). Sign
+        # convention is whatever the IMU uses - pitch_shift_sign is the
+        # field-calibration knob for that. Clamped so a transient/bad
+        # reading can't swing the window further than max_pitch_shift_deg.
+        raw_dynamic_shift_px = self.pitch_shift_sign * self.smoothed_pitch * px_per_rad
+        max_dynamic_shift_px = math.radians(self.max_pitch_shift_deg) * px_per_rad
+        dynamic_shift_px = max(-max_dynamic_shift_px, min(max_dynamic_shift_px, raw_dynamic_shift_px))
+
+        # static part: fixed camera-to-chassis mount tilt (see module
+        # docstring). A known mechanical constant, not the IMU's - always
+        # applied in full, not subject to the dynamic clamp above (that
+        # clamp bounds how far ramps/bumps can swing the window; it isn't
+        # meant to limit the permanent baseline) or to pitch_shift_sign
+        # (that's only for the IMU's own sign-convention uncertainty).
+        static_shift_px = math.radians(self.camera_tilt_deg) * px_per_rad
+
+        target_shift_px = dynamic_shift_px + static_shift_px
 
         if abs(target_shift_px - self.applied_shift_px) < self.min_shift_change_px:
             return  # not a real change - keep the current window, skip the log
@@ -172,8 +257,8 @@ class ObstacleDetector3DZones(Node):
 
         self.rows = self._shift_window(self.base_rows, target_shift_px, img_height)
         self.ground_rows = self._shift_window(self.ground_base_rows, target_shift_px, img_height)
-        print(self.time, 'pitch %.1f deg (smoothed), depth RoI shifted %+d px -> rows=%s ground_rows=%s' % (
-            math.degrees(self.smoothed_pitch), round(target_shift_px), self.rows, self.ground_rows))
+        print(self.time, 'pitch %.1f deg (smoothed) + %.1f deg (fixed mount tilt), depth RoI shifted %+d px -> rows=%s ground_rows=%s' % (
+            math.degrees(self.smoothed_pitch), self.camera_tilt_deg, round(target_shift_px), self.rows, self.ground_rows))
 
     def _dist(self, data, rows, cols, fail_value):
         r0, r1 = rows
