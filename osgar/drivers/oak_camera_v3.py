@@ -67,7 +67,8 @@ class OakCamera:
                           'depth_seq', 'color_seq', 'detections_seq', 'left_im_seq', 'right_im_seq',
                           'nn_mask:gz',
                           'pose3d', 'gridmap',
-                          'redroad:gz', 'robotourist:gz')
+                          'redroad:gz', 'robotourist:gz',
+                          'qr_code')
 
         self.is_color = config.get('is_color', False)
         self.is_depth = config.get('is_depth', False)
@@ -210,6 +211,14 @@ class OakCamera:
             assert self.is_imu_enabled, "IMU is required for SLAM and visual odometry."
             assert self.is_depth, "Depth is required for SLAM and visual odometry."
 
+        # QR code reading - decoded on host via OpenCV (offline, no NN needed),
+        # from a dedicated raw (uncompressed) output off the color camera.
+        self.is_qr_detection = config.get('is_qr_detection', False)
+        qr_resolution_value = config.get('qr_resolution', 'THE_800_P')
+        self.qr_resolution = (g_resolution_dic[qr_resolution_value] if isinstance(qr_resolution_value, str)
+                              else tuple(qr_resolution_value))
+        assert not self.is_qr_detection or self.is_color, 'is_qr_detection requires is_color'
+
         self.sleep_on_start_sec = config.get('sleep_on_start_sec')
         self.verbose_detections = config.get('verbose_detections', True)
 
@@ -297,6 +306,12 @@ class OakCamera:
                 saver.stream_type = "color"
                 saver.subsample = self.subsample
 
+                if self.is_qr_detection:
+                    # separate raw (uncompressed) output - decoding a QR code from
+                    # h265-compressed frames is unreliable, compression artifacts
+                    # blur the fine modules
+                    qr_output = cam_rgb.requestOutput(self.qr_resolution, type=dai.ImgFrame.Type.BGR888p, fps=self.fps)
+                    qr_queue = qr_output.createOutputQueue(blocking=False)
 
             if self.is_depth or self.is_stereo_images:
                 mono_left = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
@@ -499,6 +514,8 @@ class OakCamera:
             if self.flood_light_current is not None:
                 pipeline.getDefaultDevice().setIrFloodLightIntensity(self.flood_light_current)
 
+            qr_detector = cv2.QRCodeDetector() if self.is_qr_detection else None
+
             while pipeline.isRunning() and self.bus.is_alive():
                 processed_any = False
 
@@ -594,6 +611,17 @@ class OakCamera:
                                             data.rotationVector.k, data.rotationVector.real]
                                            for data in packet.packets]
                             self.bus.publish("orientation_list", quaternions)
+
+                # 6. Check QR code
+                if self.is_qr_detection:
+                    qr_frames = qr_queue.tryGetAll()
+                    if qr_frames and len(qr_frames) > 0:
+                        processed_any = True
+                        frame = qr_frames[-1].getCvFrame()
+                        text, points, _ = qr_detector.detectAndDecode(frame)
+                        if text:
+                            print('QR code decoded:', text)
+                            self.bus.publish('qr_code', text)
 
                 # Only rest the CPU if no frames were pulled in this tick loop
                 if not processed_any:

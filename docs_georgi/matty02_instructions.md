@@ -115,3 +115,5 @@ The safety button stops the current run and starts waiting. After the button is 
 * `../dtc-systems/run_dtc_loop.sh ~/git/osgar/config/matty-wait-for-start.json config/dtc-night.json`
 
 * `~/git/osgar-apps/dtc-systems/run_dtc_loop.sh ~/git/osgar/config/matty-wait-for-start.json ~/git/osgar-apps/followme/config/matty-follow-person-night.json --params app.max_speed=0.42`
+
+* `~/git/osgar-apps/dtc-systems/run_dtc_loop.sh ~/git/osgar/config/matty-wait-for-start.json ~/git/osgar-apps/followme/config/matty-tulak-obstacle.json --params app.max_speed=0.35`
