@@ -33,17 +33,46 @@
   --- Pitch-compensated row window ---
 
   `rows` (and `ground_rows`, see below) are now *base* windows that
-  get shifted up/down each frame based on current pitch (from the
-  platform's 'rotation' topic), using the mono camera's vertical FOV
-  to convert pitch angle to a pixel shift. left_cols/right_cols/
-  center_cols/ground_cols are NOT touched - pitch moves things
-  vertically, not sideways.
+  get shifted up/down each frame based on current pitch - read from the
+  OAK-D Pro's own onboard IMU ('orientation_list', a fused rotation
+  quaternion; see on_orientation_list) rather than the chassis ESP32 IMU
+  this used to read from the platform's 'rotation' topic - using the mono
+  camera's vertical FOV to convert pitch angle to a pixel shift.
+  left_cols/right_cols/center_cols/ground_cols are NOT touched - pitch
+  moves things vertically, not sideways.
 
-  Two things keep this from reacting to every bump on a suspension-
-  less chassis:
-    - the pitch used for the shift is smoothed (pitch_smoothing_alpha,
-      an exponential moving average) so a single-frame jolt barely
-      moves it, while a sustained ramp climb does
+  Four things keep this from reacting to every bump - or worse, turn -
+  on a suspension-less chassis:
+    - samples the IMU itself reports as degraded (estimated orientation
+      error above max_pitch_error_rad - a per-sample field the chassis
+      IMU never exposed) are dropped before they can affect pitch at
+      all, not just smoothed over afterward - see on_orientation_list
+    - samples with a physically-implausible roll (above
+      max_plausible_roll_deg) are ALSO dropped, independent of the above
+      - field testing found a sharp turn can corrupt the fused
+      orientation (roll swinging to -64deg on a chassis that cannot
+      physically roll that far) while max_pitch_error_deg's own
+      confidence field stays at 0.0 the whole time, not catching it.
+      Classic accel+gyro-fusion failure mode: lateral/centripetal
+      acceleration during a turn gets misread as a change in gravity
+      direction. Since pitch comes from the same quaternion as roll,
+      it's corrupted too whenever this happens - see on_orientation_list.
+    - the pitch used for the shift is further smoothed (pitch_smoothing_
+      alpha, an exponential moving average) so a single-frame jolt
+      barely moves it, while a sustained ramp climb does. Time constant
+      is roughly (depth frame interval) / pitch_smoothing_alpha - e.g.
+      at 10fps and alpha=0.15, ~0.7s. Can be tuned faster than a naive
+      IMU-smoothing design would allow, because the accuracy gate above
+      already screens out the samples most likely to be vibration/shock
+      artifacts before they ever reach this EMA - this layer now mainly
+      has to reject residual single-frame noise among ALREADY-trusted
+      samples, not do all the noise rejection alone. If the window still
+      feels laggy after raising this, check whether max_pitch_error_deg
+      is rejecting too large a fraction of samples during the exact
+      moments responsiveness matters (e.g. while actually climbing a
+      ramp, which is also when vibration - and rejections - increase) -
+      watch pitch_error_deg vs max_pitch_error_deg in the verbose log/HUD
+      during a real transition before assuming the EMA alone is at fault.
     - the window only actually updates (and only logs) once the
       smoothed pitch implies a shift of at least min_shift_change_px
       pixels since the last update - small noise changes nothing
@@ -51,14 +80,55 @@
   When the window does move, it prints a line (unconditionally, not
   only under verbose) so you can see it happening from the OS console.
 
-  This needs two things verified for your actual hardware/mount, same
-  spirit as the "not calibrated" note on left/right columns above:
+  This needs several things verified for your actual hardware/mount,
+  same spirit as the "not calibrated" note on left/right columns above:
     - vertical_fov_deg: defaults to 55, the OV9282 mono VFOV Luxonis
       lists for the STANDARD (non-"W"/wide) OAK-D Pro.
-    - pitch_shift_sign: defaults to +1. If the window moves toward sky
-      instead of toward the ramp when you tilt the robot nose up,
-      flip this to -1. Watch the printed 'rows' value while tilting
-      the camera by hand to check.
+    - the pitch AXIS itself (see _quat_to_rpy): CONFIRMED correct via
+      hand-tilt test (rotating the camera changes roll_deg, tilting it
+      changes pitch_deg monotonically, yaw_deg tracks heading) - each
+      Euler angle tracks the physical motion its name implies.
+    - pitch_offset_deg: defaults to 0, but should NOT be 0 in practice.
+      The IMU die sits at some fixed rotation inside the OAK-D Pro
+      housing that does not line up with "camera level" - field testing
+      found ~80 deg of raw pitch at genuine standstill, not ~0. This is
+      what was actually causing the shift to sit pinned at
+      +-max_pitch_shift_deg's clamp even on a level chassis - NOT an
+      axis or sign problem, a missing zero-calibration. To (re)capture
+      it: rest the robot on a GENUINELY level surface (check with an
+      actual level/phone app, not by eye), read pitch_raw_deg off the
+      verbose log or view_obstacle.py's "IMU raw" HUD line, and set that
+      reading as pitch_offset_deg. It is subtracted from every raw pitch
+      before anything else touches it (see on_orientation_list). This is
+      a plain scalar offset, not a full rotation correction - since
+      BNO08x roll/pitch are gravity-referenced (see module docstring's
+      IMU section), it should hold regardless of which way the robot is
+      facing (yaw), but does NOT account for cross-talk from simultaneous
+      large roll (e.g. driving across a side-slope). Watch pitch_deg
+      while rolling the chassis on purpose if that turns out to matter -
+      if pitch swings noticeably with pure roll and no real pitch change,
+      the fix is a full reference-quaternion delta instead of a scalar
+      offset, not a bigger/smaller number here.
+    - pitch_shift_sign: defaults to +1, currently -1. Derived (not yet
+      field-verified with the shift re-enabled) from the hand-tilt
+      result: pitch_deg DECREASES as the nose lifts, and for the window
+      to move the correct direction (down/toward the ramp) as pitch
+      physically increases, pitch_shift_sign must be negative when pitch
+      itself moves opposite to physical nose-up rotation - which is the
+      case here. Re-verify once max_pitch_shift_deg is back above 0: if
+      the window still moves toward sky instead of toward the ramp when
+      you tilt the robot nose up, flip this sign.
+    - max_pitch_error_deg: defaults to 15. This is the BNO08x's own
+      estimated orientation error (rotationVectorAccuracy, in radians -
+      LOWER is better despite the name; see on_orientation_list for why
+      that's worth double-checking rather than assuming), NOT the
+      separate 0-3 UNRELIABLE..HIGH categorical accuracy enum. 15 deg is
+      an unverified starting point - log the raw error_rad values on
+      real rough ground (degrees = easier to eyeball) and tighten or
+      loosen from there. Watch how often "keeping last trusted pitch"
+      logs before tightening further, since a threshold too strict just
+      stops the window moving at all rather than making it move
+      correctly.
 
   If pitch ever pushes a window past the top/bottom of the frame, it
   is clamped to stay in-bounds rather than shrinking or wrapping.
@@ -111,8 +181,8 @@
   --- Startup: robot powers on already tilted ---
 
   self.smoothed_pitch (the EMA of dynamic IMU pitch, see above) starts
-  at 0 and only snaps to the very first 'rotation' reading it gets,
-  after which it settles normally via the slow EMA (pitch_smoothing_
+  at 0 and only snaps to the very first accuracy-passing 'orientation_list'
+  reading it gets, after which it settles normally via the slow EMA (pitch_smoothing_
   alpha is deliberately slow - around a 1-2s time constant at typical
   depth fps - specifically so a single bump/jolt can't yank the window
   around). Without that snap, if the chassis happens to already be
@@ -198,9 +268,46 @@ class ObstacleDetector3DZones(Node):
         self.pitch_smoothing_alpha = config.get('pitch_smoothing_alpha', 0.05)
         self.min_shift_change_px = config.get('min_shift_change_px', 12)
         self.camera_tilt_deg = config.get('camera_tilt_deg', 0)  # fixed mount tilt, see docstring
-        self.pitch = 0.0            # radians, latest raw sample from 'rotation'
+        # The OAK's own IMU die is mounted at some fixed rotation inside
+        # the housing that does NOT line up with "camera level" - field
+        # testing found it reads ~80 deg of pitch at genuine standstill,
+        # not ~0. This is a constant, additive calibration offset
+        # (subtracted from every raw pitch reading below, in
+        # on_orientation_list), NOT a sign or axis problem - confirmed by
+        # hand-tilt testing: roll/pitch/yaw each track the correct
+        # physical motion (rotating the camera moves roll_deg, tilting it
+        # moves pitch_deg monotonically, yaw_deg tracks heading), just
+        # pitch_deg's zero point is offset by this fixed amount. See the
+        # module docstring for how to (re)capture this value.
+        self.pitch_offset_rad = math.radians(config.get('pitch_offset_deg', 0))
+        # Physical-plausibility backstop, separate from max_pitch_error_deg:
+        # field testing (2026-08) caught a sharp turn producing roll=-64deg
+        # while pitch_error_deg (the BNO08x's own confidence field) stayed
+        # at 0.0 the whole time - the sensor's own error estimate does NOT
+        # catch this failure mode. Matty has no suspension and no
+        # independent roll DOF, so real roll should stay well under this on
+        # any terrain it can actually drive on; a reading beyond it means
+        # the fused "down" vector is corrupted right now (classic failure
+        # of accel+gyro-only fusion under lateral/centripetal acceleration,
+        # e.g. mid-turn) - since pitch comes from the SAME quaternion, it's
+        # equally untrustworthy this sample. 30 deg is a starting point,
+        # not calibrated - loosen if genuine rough-terrain roll gets
+        # rejected, tighten if turn-corrupted pitch still leaks through.
+        self.max_plausible_roll_rad = math.radians(config.get('max_plausible_roll_deg', 30))
+        # rotationVectorAccuracy (see on_orientation_list) is the BNO08x's
+        # own ESTIMATED ORIENTATION ERROR, in radians - LOWER is better,
+        # the opposite sense its name suggests. Samples above this are
+        # dropped rather than fed into pitch/smoothed_pitch. 15 deg is a
+        # starting point, NOT calibrated - log the raw values on real rough
+        # ground first (see module docstring) and tighten/loosen from there.
+        self.max_pitch_error_rad = math.radians(config.get('max_pitch_error_deg', 15))
+        self.last_pitch_error_rad = None  # most recent sample's error, whether accepted or rejected - see on_orientation_list/verbose log, for tuning max_pitch_error_deg in the field
+        self.pitch = 0.0            # radians, offset-corrected - see on_orientation_list. Feeds the actual shift math.
+        self.last_raw_pitch = 0.0   # radians, UNCORRECTED (no pitch_offset_rad applied) - diagnostics/recalibration only, see verbose log
+        self.last_roll = 0.0        # radians, diagnostics only - see on_orientation_list/verbose log
+        self.last_yaw = 0.0         # radians, diagnostics only - see on_orientation_list/verbose log
         self.smoothed_pitch = 0.0   # radians, EMA of the above
-        self._pitch_initialized = False  # see on_rotation - snap instead of EMA-ramp on the first reading
+        self._pitch_initialized = False  # see on_orientation_list - snap instead of EMA-ramp on the first reading
         self.applied_shift_px = 0.0
         self.rows = self.base_rows
 
@@ -211,16 +318,90 @@ class ObstacleDetector3DZones(Node):
         self.near_object_suppress_dist = config.get('near_object_suppress_dist', 0.3)
         self.ground_rows = self.ground_base_rows
 
-    def on_rotation(self, data):
-        # platform publishes [9000 - yaw, -pitch, roll], all in centidegrees -
-        # data[1] is -pitch, whatever sign convention the platform's IMU uses
-        self.pitch = math.radians(data[1] / 100.0)
-        if not self._pitch_initialized:
-            # snap instead of letting the EMA ramp up from 0 - see
-            # "Startup: robot powers on already tilted" in the module
-            # docstring for why the slow EMA is exactly wrong here
-            self.smoothed_pitch = self.pitch
-            self._pitch_initialized = True
+    @staticmethod
+    def _quat_to_rpy(w, x, y, z):
+        """Aerospace yaw-pitch-roll (ZYX) Euler angles, in radians, from
+        the OAK's fused rotation quaternion (w=real, x=i, y=j, z=k).
+        Returns (roll, pitch, yaw). Which of these three is actually
+        Matty's physical nose-up/down pitch is NOT verified against how
+        the IMU die sits inside the OAK-D Pro housing on this mount - all
+        three are computed (not just pitch) specifically so a hand-tilt
+        test can identify which one tracks which physical motion, rather
+        than assuming "pitch" is correct. See on_orientation_list and the
+        "Pitch-compensated row window" section of the module docstring.
+        Symptom of picking the wrong one: the shift saturates at
+        max_pitch_shift_deg's clamp even while the chassis is roughly
+        level, because the axis being read is a large, unrelated angle
+        (e.g. a ~90 deg mounting roll) rather than the small real pitch."""
+        roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
+        sin_pitch = max(-1.0, min(1.0, 2 * (w * y - z * x)))  # clamp - guards asin() right at +-90 deg
+        pitch = math.asin(sin_pitch)
+        yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        return roll, pitch, yaw
+
+    def on_orientation_list(self, data):
+        """data: batched samples from the OAK-D Pro's own onboard IMU (see
+        oak_camera_v3.py's is_imu_enabled path), each entry
+        [timestamp_sec, error_rad, i, j, k, real]. Using the camera's own
+        IMU here (instead of the chassis ESP32 IMU this used to read from
+        'rotation') means the pitch measured is the one that actually
+        matters for this module - how the CAMERA is oriented, not the
+        chassis - and each sample carries the BNO08x's own real-time
+        estimate of how much to trust it, something the chassis IMU never
+        exposed. That matters on a suspension-less chassis: a sample the
+        sensor's own fusion algorithm already flagged as degraded
+        (typically exactly the vibration/shock case) is dropped here
+        before it ever reaches the smoothing EMA, instead of only being
+        smoothed over after the fact.
+
+        CAUTION (a real gotcha, not a hypothetical): despite depthai
+        calling this field '...Accuracy', it is NOT the categorical
+        IMUReport.Accuracy enum (0=UNRELIABLE..3=HIGH, higher=better) - it
+        is IMUReportRotationVectorWAcc.rotationVectorAccuracy, the SH-2
+        firmware's own ESTIMATED ORIENTATION ERROR IN RADIANS, where
+        LOWER means better (near 0 = confident, growing toward pi =
+        worthless) - see the CEVA BNO08x datasheet's 'Rotation Vector
+        Accuracy Estimate'. Comparing it the wrong way round silently
+        inverts this whole safeguard - accepting exactly the degraded
+        samples it exists to reject.
+
+        A whole batch landing above max_pitch_error_rad is not an error -
+        the previously trusted pitch is simply kept for this cycle rather
+        than pulled toward a low-confidence reading."""
+        if data:
+            # most recent sample's error, regardless of whether it passes
+            # the threshold below - purely for the verbose log, so
+            # max_pitch_error_deg can actually be tuned against real data
+            self.last_pitch_error_rad = data[-1][1]
+        for timestamp, error_rad, i, j, k, real in reversed(data):
+            if error_rad > self.max_pitch_error_rad:
+                continue
+            roll, raw_pitch, yaw = self._quat_to_rpy(real, i, j, k)
+            # last_roll/last_yaw/last_raw_pitch are updated here regardless
+            # of the plausibility check below, so a corrupted reading is
+            # still VISIBLE in the verbose log/HUD for debugging - only
+            # self.pitch (the value that actually drives the shift) is
+            # withheld from a sample that fails it.
+            self.last_roll, self.last_raw_pitch, self.last_yaw = roll, raw_pitch, yaw
+            if abs(roll) > self.max_plausible_roll_rad:
+                # see max_plausible_roll_rad in __init__ - a corrupted
+                # fused orientation (typically mid-turn) poisons pitch too,
+                # since both come from the same quaternion. Try the next
+                # (older) sample in this batch instead of using this one.
+                continue
+            # pitch_offset_rad corrects the fixed IMU-mount-vs-camera-level
+            # misalignment (see __init__) - applied here, before smoothing/
+            # shift/clamp, so everything downstream operates on a properly-
+            # zeroed value same as before this offset existed.
+            self.pitch = raw_pitch - self.pitch_offset_rad
+            if not self._pitch_initialized:
+                # snap instead of letting the EMA ramp up from 0 - see
+                # "Startup: robot powers on already tilted" in the
+                # module docstring for why the slow EMA is exactly
+                # wrong here
+                self.smoothed_pitch = self.pitch
+                self._pitch_initialized = True
+            return
 
     def _shift_window(self, base_rows, shift_px, img_height):
         r0, r1 = base_rows
@@ -301,7 +482,18 @@ class ObstacleDetector3DZones(Node):
         self.publish('ground_hazard', [ground_hazard, round(ground_valid_frac, 3), ground_dist])
 
         if self.verbose:
-            print(self.time, 'pitch_deg', round(math.degrees(self.smoothed_pitch), 1),
+            error_deg = round(math.degrees(self.last_pitch_error_rad), 1) if self.last_pitch_error_rad is not None else None
+            # roll_deg/yaw_deg are printed alongside pitch_deg specifically
+            # for the hand-tilt axis-mapping test - see _quat_to_rpy. If
+            # pitch_deg stays pinned near max_pitch_shift_deg while the
+            # chassis sits level, check whether roll_deg or yaw_deg is the
+            # one actually swinging when you tilt the camera nose up/down.
+            print(self.time, 'roll_deg', round(math.degrees(self.last_roll), 1),
+                  'pitch_deg', round(math.degrees(self.smoothed_pitch), 1),
+                  'pitch_raw_deg', round(math.degrees(self.last_raw_pitch), 1),
+                  'pitch_offset_deg', round(math.degrees(self.pitch_offset_rad), 1),
+                  'yaw_deg', round(math.degrees(self.last_yaw), 1),
+                  'pitch_error_deg', error_deg, '(max', round(math.degrees(self.max_pitch_error_rad), 1), ')',
                   'rows', self.rows, 'zones', left, center, right,
                   'ground_valid_frac', round(ground_valid_frac, 2), 'ground_dist', ground_dist)
 

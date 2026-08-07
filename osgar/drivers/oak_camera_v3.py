@@ -580,7 +580,11 @@ class OakCamera:
                         dt = depth_frame.getTimestamp()
                         timestamp_us = ((dt.days * 24 * 3600 + dt.seconds) * 1000000 + dt.microseconds)
                         self.bus.publish("depth_seq", [seq_num, timestamp_us])
-                        self.bus.publish("depth", depth_frame.getCvFrame())
+                        frame = depth_frame.getCvFrame()
+                        frame_cp = frame.copy()
+                        upper = frame_cp[:280]
+                        upper[upper == 0] = 15000
+                        self.bus.publish("depth", frame_cp)
 
                 # 3. Check Visual Odom
                 if self.is_visual_odom:

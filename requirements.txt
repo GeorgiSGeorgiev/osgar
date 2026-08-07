@@ -3,10 +3,9 @@ pyserial==3.5
 msgpack==1.0.5
 pyusb==1.2.1
 opencv-python==4.7.0.72
-requests==2.28.2
 pyzmq==25.0.2
-pyrealsense2==2.53.1.4623
-numpy==1.23.0
+#pyrealsense2==2.53.1.4623
+numpy>=1.23.5,<2
 protobuf==3.20.0
 prpy==0.3.7
 psutil==7.0.0
@@ -19,7 +18,7 @@ pygame==2.6.1
 Pygments==2.19.2
 pyparsing==3.2.3
 pyreadline3==3.5.4
-pyrealsense2==2.53.1.4623
+#pyrealsense2==2.53.1.4623
 pyserial==3.5
 python-dateutil==2.9.0.post0
 python-dotenv==1.1.1
@@ -32,7 +31,7 @@ pyVHR-cpu==1.0.2
 PyYAML==6.0.2
 pyzmq==25.0.2
 Qt.py==1.4.6
-requests==2.28.2
+requests>=2.32.0
 requests-oauthlib==2.0.0
 rsa==4.9.1
 scikit-learn==1.6.1

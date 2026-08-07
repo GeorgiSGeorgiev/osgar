@@ -18,6 +18,7 @@
 3. `sudo nmcli r wifi on`
 
 4. `sudo nmcli d wifi connec SSID password PASSWORD`
+5. `nmcli device wifi list --rescan yes`
 
 # Transfer files
 
