@@ -30,6 +30,27 @@
   hard stops. Left/right are only ever used to pick a turn direction,
   so an untrusted window there is reported as None (unknown) instead.
 
+  --- Free-space profile (depth_profile) ---
+
+  A fourth output, additional to and independent of obstacle_zones:
+  free_space_bins distances (default 9) across free_space_cols, same
+  row window and per-bin logic as the L/C/R zones, just finer-grained -
+  a coarse 1D depth scan rather than a 3-way left/centre/right split.
+  Purely additive - obstacle_zones is unchanged, still the only thing
+  hard-stop/avoidance logic should key off.
+
+  Deliberately NOT thresholded here into "open"/"blocked" the way the
+  hard-avoidance zones are - that would require knowing what counts as
+  "open enough", which is a moving target (see tulak_obstacle.py's
+  adaptive turning_dist) that this module has no visibility into. This
+  just reports the raw per-bin distances (None where a bin has too
+  little valid data, same convention as left/right) and lets the
+  consumer decide what "open" means for its own current situation - see
+  tulak_obstacle.py's _free_space_steering for the intended use (a
+  continuous steering nudge toward whichever bins have the most
+  clearance, meant to run well before the discrete avoidance state
+  machine's threshold, not replace it).
+
   --- Pitch-compensated row window ---
 
   `rows` (and `ground_rows`, see below) are now *base* windows that
@@ -251,12 +272,21 @@ from osgar.node import Node
 class ObstacleDetector3DZones(Node):
     def __init__(self, config, bus):
         super().__init__(config, bus)
-        bus.register('obstacle_zones', 'ground_hazard')
+        bus.register('obstacle_zones', 'ground_hazard', 'depth_profile')
 
         self.base_rows = tuple(config.get('rows', [200, 300]))
         self.center_cols = tuple(config.get('center_cols', [200, 460]))
         self.left_cols = tuple(config.get('left_cols', [0, 150]))
         self.right_cols = tuple(config.get('right_cols', [490, 640]))
+
+        # depth_profile (see module docstring, "free-space profile" section)
+        # - a finer-grained N-bin distance scan across free_space_cols,
+        # published purely as additional data. left_cols[0]/right_cols[1]
+        # as the default span reuses whatever lateral field the L/C/R
+        # zones already consider relevant, rather than introducing a
+        # fourth independently-tuned column range.
+        self.free_space_cols = tuple(config.get('free_space_cols', [self.left_cols[0], self.right_cols[1]]))
+        self.free_space_bins = config.get('free_space_bins', 9)
 
         self.percentile = config.get('percentile', 5)  # 0 = classic min, like the original
         self.min_valid_frac = config.get('min_valid_frac', 0.05)
@@ -450,6 +480,18 @@ class ObstacleDetector3DZones(Node):
             return fail_value
         return float(np.percentile(selection[mask], self.percentile) / 1000)
 
+    def _depth_profile(self, data):
+        """free_space_bins distances across free_space_cols, same row
+        window (self.rows - already pitch-compensated) and same per-bin
+        _dist() logic as the L/C/R zones, just finer-grained. None for a
+        bin with too little valid data (same fail_value=None convention
+        as left/right - "unknown", not "assume worst", since this is only
+        ever used for a gradual steering nudge, never a hard stop)."""
+        c0, c1 = self.free_space_cols
+        edges = np.linspace(c0, c1, self.free_space_bins + 1).astype(int)
+        return [self._dist(data, self.rows, (edges[i], edges[i + 1]), fail_value=None)
+                for i in range(self.free_space_bins)]
+
     def _ground_reading(self, data):
         r0, r1 = self.ground_rows
         c0, c1 = self.ground_cols
@@ -469,6 +511,7 @@ class ObstacleDetector3DZones(Node):
         left = self._dist(data, self.rows, self.left_cols, fail_value=None)
         right = self._dist(data, self.rows, self.right_cols, fail_value=None)
         self.publish('obstacle_zones', [left, center, right])
+        self.publish('depth_profile', self._depth_profile(data))
 
         ground_valid_frac, ground_dist = self._ground_reading(data)
         ground_bad = (ground_valid_frac < self.min_valid_frac) or \

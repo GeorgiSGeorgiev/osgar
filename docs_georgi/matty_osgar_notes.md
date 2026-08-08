@@ -41,3 +41,11 @@ Tulak Obstacle V0:
 5. No advanced navigation using OpenStreetMap
 6. No waypoint placing
 7. Doesn't work indoors anymore or in cramped spaces (aggressive overcorrection)
+
+Tulak Obstacle V1:
+
+1. Stabilized indoors
+   1. Now Matty is the smooth operator.
+   2. Was able to do full rounds around the apartment.
+   2. Still overcorrecting (probably the 30 deg/s setting).
+   3. When reversing, it correctly follows the same path, but then it often decides to repeat the same actions that lead Matty to the dead-end.
