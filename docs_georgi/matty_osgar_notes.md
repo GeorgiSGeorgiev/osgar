@@ -30,3 +30,14 @@
 * 'oak.left_im_seq'
 * 'oak.right_im_seq'
 * 'oak.nn_mask'
+
+
+Tulak Obstacle V0:
+
+1. Working outdoors obstacle avoidance, stable, almost no FPs
+2. Limited dead-end situations
+3. GPS somehow working (needs 5m of driving for accurate estimate)
+4. QR code reading working
+5. No advanced navigation using OpenStreetMap
+6. No waypoint placing
+7. Doesn't work indoors anymore or in cramped spaces (aggressive overcorrection)

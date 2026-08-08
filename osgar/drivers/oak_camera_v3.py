@@ -582,7 +582,7 @@ class OakCamera:
                         self.bus.publish("depth_seq", [seq_num, timestamp_us])
                         frame = depth_frame.getCvFrame()
                         frame_cp = frame.copy()
-                        upper = frame_cp[:280]
+                        upper = frame_cp[:300]
                         upper[upper == 0] = 15000
                         self.bus.publish("depth", frame_cp)
 
