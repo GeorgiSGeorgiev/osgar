@@ -47,5 +47,8 @@ Tulak Obstacle V1:
 1. Stabilized indoors
    1. Now Matty is the smooth operator.
    2. Was able to do full rounds around the apartment.
-   2. Still overcorrecting (probably the 30 deg/s setting).
-   3. When reversing, it correctly follows the same path, but then it often decides to repeat the same actions that lead Matty to the dead-end.
+   3. Still overcorrecting (probably the 30 deg/s setting).
+   4. When reversing, it correctly follows the same path, but then it often decides to repeat the same actions.
+   5. GPS still unstable (mainly under trees)- the circle situation
+   6. Maybe there is too much smoothness - Matty slows down too often
+   7. Bumpers fixed, now they behave more like bumpers, actually stopping the actions.
