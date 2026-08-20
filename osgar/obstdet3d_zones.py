@@ -51,6 +51,20 @@
   clearance, meant to run well before the discrete avoidance state
   machine's threshold, not replace it).
 
+  --- Synthetic far-fill cross-check ---
+
+  oak_camera_v3.py remaps invalid pixels in the upper frame to a large
+  constant (depth_far_mask_value_mm) so sky / out-of-range background
+  reads as "far" rather than tripping the fail-safe below and freezing
+  the robot. Necessary, and unchanged - but its blackout gate is
+  evaluated over the whole masked region while the fill is applied
+  per-pixel, so a locally-blind zone window (sunlit or low-texture wall
+  at close range) gets filled too, and then reads as a confident "15m
+  clear". _sanitize_zones() drops such a reading ONLY when a different
+  zone actually measured something close, substituting that measured
+  distance. When every zone reads far - the real open-sky case - it does
+  nothing at all. See far_fill_suspect_m in __init__.
+
   --- Pitch-compensated row window ---
 
   `rows` (and `ground_rows`, see below) are now *base* windows that
@@ -264,6 +278,7 @@
 """
 import math
 
+import cv2
 import numpy as np
 
 from osgar.node import Node
@@ -287,9 +302,110 @@ class ObstacleDetector3DZones(Node):
         # fourth independently-tuned column range.
         self.free_space_cols = tuple(config.get('free_space_cols', [self.left_cols[0], self.right_cols[1]]))
         self.free_space_bins = config.get('free_space_bins', 9)
+        # see _sanitize_profile - meters a bin must read farther than
+        # BOTH its immediate neighbors before being treated as an
+        # isolated (likely artifact) reading rather than a real opening.
+        # 0 disables this.
+        self.profile_isolated_bin_margin = config.get('profile_isolated_bin_margin', 0.5)
 
         self.percentile = config.get('percentile', 5)  # 0 = classic min, like the original
         self.min_valid_frac = config.get('min_valid_frac', 0.05)
+
+        # --- synthetic far-fill cross-check (see _sanitize_zones) ---
+        # oak_camera_v3.py's depth_far_mask_* remaps invalid pixels in the
+        # UPPER part of the frame to a large constant (depth_far_mask_value_mm,
+        # 15000 by default) so that sky / genuinely-out-of-range background
+        # reads as "far" instead of tripping min_valid_frac's fail-safe and
+        # freezing the robot. That remap is necessary and stays - but its
+        # "is this a real blackout?" gate is evaluated over the WHOLE masked
+        # region at once, while the fill is applied per-pixel. So a single
+        # zone window that is locally blind (a low-texture or sunlit wall
+        # close enough to kill the stereo match) still gets filled, as long
+        # as the rest of the region has enough valid pixels to keep the
+        # global gate happy. Field logs (2026-08-20, tight indoor passage)
+        # show exactly this: zone windows 51-78% synthetic fill, ~1% real
+        # measurement, reported as a confident 15.00m "clear" - while the
+        # neighbouring zones were reading 0.4-0.8m.
+        #
+        # far_fill_suspect_m: a reading at/above this is treated as "this is
+        # the synthetic fill constant, not a measurement". Keep it just under
+        # the oak module's depth_far_mask_value_mm/1000 (15.0 -> 13.5).
+        # far_fill_contradiction_m: another zone must have MEASURED something
+        # closer than this for the suspect reading to be downgraded.
+        # Set far_fill_suspect_m to 0 to disable this entirely.
+        self.far_fill_suspect_m = config.get('far_fill_suspect_m', 13.5)
+        self.far_fill_contradiction_m = config.get('far_fill_contradiction_m', 2.0)
+
+        # Software stand-in for the OAK's own on-device SpeckleFilter -
+        # deliberately NOT the on-device filter itself, which has been
+        # observed to run the camera out of memory on this hardware and
+        # must stay disabled in the oak module's own config. Runs here on
+        # the host instead, at negligible cost given how small each zone/
+        # bin window is. Strips small isolated blobs of "valid" (nonzero)
+        # pixels via binary erosion before min_valid_frac/percentile ever
+        # see them - see _valid_mask(). This targets a specific failure
+        # mode percentile/min_valid_frac alone do NOT catch: a window
+        # that is mostly correctly-invalid (out of stereo range - e.g.
+        # pressed close against a glossy/low-texture surface, or an
+        # irregular surface like a wire-mesh gabion wall where only a
+        # sliver of pixels get a clean match) but has a small sliver of
+        # spuriously-VALID pixels reading an implausibly FAR distance.
+        # With only that sliver counted, mask.mean() can clear even a
+        # generous min_valid_frac, and percentile-5 of an all-far sliver
+        # is still far - the window gets reported as confidently open
+        # when it's actually a near-invalid wall. A lone sliver narrower
+        # than speckle_erode_px in any direction is erased entirely by
+        # the erosion and correctly falls back to "unknown" instead. A
+        # genuinely large, spatially coherent valid region (a real wall/
+        # floor/ground reading) survives erosion basically intact - only
+        # its outer speckle_erode_px//2-pixel border shrinks away.
+        # speckle_erode_px=0 disables this (mask used as-is, old
+        # behaviour). Not field-calibrated - a real object narrower than
+        # this in the depth image (a thin, distant pole) would also get
+        # erased; watch ground_valid_frac/zone readings in the field
+        # before tuning it down.
+        speckle_erode_px = config.get('speckle_erode_px', 3)
+        self._erode_kernel = (np.ones((speckle_erode_px, speckle_erode_px), np.uint8)
+                               if speckle_erode_px > 0 else None)
+
+        # Asymmetric spatial fill - a deliberately one-sided stand-in for
+        # the OAK's own SpatialFilter (also kept off-device, same memory
+        # reason as SpeckleFilter above). A normal spatial filter fills
+        # an invalid pixel with whatever's nearby, near OR far - which is
+        # exactly what made a specular-reflection or wire-mesh false-far
+        # sliver dangerous (see speckle_erode_px above): propagating that
+        # into a mostly-invalid, actually-close window made it read as
+        # confidently open. This filter can only ever ADD support for
+        # "something is close nearby" - an invalid pixel is filled with
+        # the NEAREST reading among its valid neighbors, but ONLY if that
+        # neighbor is itself no farther than spatial_fill_max_dist_mm.
+        # A far reading is never a fill source, full stop, regardless of
+        # whether it's the "nearest" (in pixel-distance, not depth) valid
+        # neighbor around - so this cannot recreate the false-far-sliver
+        # failure mode, in either run order relative to the erosion above.
+        #
+        # Deliberately run BEFORE erosion (see _process()), not after -
+        # the field case this targets is a physically thin object (a
+        # table leg) whose true depth return is naturally sparse: a few
+        # scattered valid-but-isolated near pixels, each individually
+        # smaller than speckle_erode_px and so erased by erosion on its
+        # own. Filling first bridges those scattered near pixels into one
+        # connected-enough blob that the erosion pass no longer wipes out
+        # entirely. Running erosion first would erase the leg's sparse
+        # signal before fill ever got a chance to bridge it - fixing
+        # nothing. The near-source-only restriction above is what makes
+        # fill-before-erode safe to do despite the erosion module's
+        # original false-far-sliver motivation.
+        #
+        # spatial_fill_px=0 disables this (old behaviour: erosion only).
+        # Neither value is field-calibrated - watch zone/depth_profile
+        # readings against a real thin object AND a real glossy/mesh
+        # surface before trusting either default.
+        spatial_fill_px = config.get('spatial_fill_px', 5)
+        self._fill_kernel = (np.ones((spatial_fill_px, spatial_fill_px), np.float32)
+                              if spatial_fill_px > 0 else None)
+        self.spatial_fill_max_dist_mm = config.get('spatial_fill_max_dist_mm', 2000)
+        self._FILL_SENTINEL = np.float32(1e6)  # far larger than any real/clipped depth (mm)
 
         # pitch-compensated row window (see module docstring)
         self.vertical_fov_deg = config.get('vertical_fov_deg', 55)
@@ -340,6 +456,28 @@ class ObstacleDetector3DZones(Node):
         self._pitch_initialized = False  # see on_orientation_list - snap instead of EMA-ramp on the first reading
         self.applied_shift_px = 0.0
         self.rows = self.base_rows
+
+        # depth_profile's own row window - defaults to base_rows (the
+        # same band the L/C/R zones use) for backward compatibility, but
+        # can be given a taller span via config. The free-space nudge
+        # (tulak_obstacle.py's _free_space_steering) is a continuous,
+        # every-frame signal with no confirm-frame debounce, so in
+        # principle it should be the FIRST thing to react to an
+        # approaching obstacle - but if the obstacle's near surface sits
+        # just outside the (narrow, ~85px) center-zone row band at the
+        # camera's current angle/distance, depth_profile stays "9/9 open"
+        # right up until the obstacle finally sweeps into that same thin
+        # band, by which point turning_dist is already close behind and
+        # there's little lead time left. A taller free_space_rows band
+        # gives the profile more vertical context to catch that surface
+        # earlier, at the cost of being a coarser "is there something
+        # somewhere in this taller slice" read rather than a precise
+        # eye-level one - deliberately NOT the full frame height (that
+        # would mix floor and sky into the same average and mean nothing).
+        # NOT calibrated - a starting point to check against a real depth
+        # viewer, same as every other row/col window in this module.
+        self.free_space_base_rows = tuple(config.get('free_space_rows', self.base_rows))
+        self.free_space_rows = self.free_space_base_rows
 
         # ground / drop-off check (see module docstring - NOT calibrated)
         self.ground_base_rows = tuple(config.get('ground_rows', [370, 395]))
@@ -468,35 +606,169 @@ class ObstacleDetector3DZones(Node):
 
         self.rows = self._shift_window(self.base_rows, target_shift_px, img_height)
         self.ground_rows = self._shift_window(self.ground_base_rows, target_shift_px, img_height)
-        print(self.time, 'pitch %.1f deg (smoothed) + %.1f deg (fixed mount tilt), depth RoI shifted %+d px -> rows=%s ground_rows=%s' % (
-            math.degrees(self.smoothed_pitch), self.camera_tilt_deg, round(target_shift_px), self.rows, self.ground_rows))
+        self.free_space_rows = self._shift_window(self.free_space_base_rows, target_shift_px, img_height)
+        print(self.time, 'pitch %.1f deg (smoothed) + %.1f deg (fixed mount tilt), depth RoI shifted %+d px -> rows=%s ground_rows=%s free_space_rows=%s' % (
+            math.degrees(self.smoothed_pitch), self.camera_tilt_deg, round(target_shift_px), self.rows, self.ground_rows, self.free_space_rows))
+
+    def _fill_near(self, selection):
+        """Fill invalid (0) pixels with the nearest reading among valid
+        neighbors within spatial_fill_px, but ONLY where that neighbor is
+        no farther than spatial_fill_max_dist_mm - see _fill_kernel in
+        __init__ for the full rationale (asymmetric: can only manufacture
+        support for "near", never "far"). Implemented as a grayscale
+        erosion (= neighborhood MINIMUM) over an image where every pixel
+        that doesn't qualify as a near source (invalid, OR valid but
+        farther than the cutoff) is replaced with a sentinel far larger
+        than any real depth - so the neighborhood minimum only "sees"
+        qualifying near sources, and pixels with no such neighbor within
+        reach keep the sentinel and are left untouched below."""
+        if self._fill_kernel is None:
+            return selection
+        near_source = np.where((selection > 0) & (selection <= self.spatial_fill_max_dist_mm),
+                                selection, self._FILL_SENTINEL).astype(np.float32)
+        nearest_within_reach = cv2.erode(near_source, self._fill_kernel)
+        fillable = (selection == 0) & (nearest_within_reach < self._FILL_SENTINEL)
+        if not fillable.any():
+            return selection
+        filled = selection.copy()
+        filled[fillable] = nearest_within_reach[fillable]
+        return filled
+
+    def _process(self, selection):
+        """Runs the asymmetric near-only fill (_fill_near) THEN the
+        speckle erosion, in that order - see _fill_kernel's docstring in
+        __init__ for why this order is what actually helps a sparse thin
+        object survive erosion, and why it's still safe against
+        resurrecting a false-far-sliver despite running before erosion.
+        Returns (selection_filled, valid_mask) - use them together
+        (selection_filled[valid_mask]), not the original raw selection,
+        so a filled-in near reading actually participates in the
+        percentile distance below."""
+        selection = self._fill_near(selection)
+        mask = selection > 0
+        if self._erode_kernel is not None:
+            mask = cv2.erode(mask.astype(np.uint8), self._erode_kernel).astype(bool)
+        return selection, mask
 
     def _dist(self, data, rows, cols, fail_value):
         r0, r1 = rows
         c0, c1 = cols
-        selection = data[r0:r1, c0:c1]
-        mask = selection > 0
+        selection, mask = self._process(data[r0:r1, c0:c1])
         if mask.mean() < self.min_valid_frac:
             return fail_value
         return float(np.percentile(selection[mask], self.percentile) / 1000)
 
+    def _sanitize_profile(self, profile):
+        """A stereo mismatch on a flat, low-texture surface (a plain
+        painted wall is a field-observed case) can produce a coherent,
+        MEDIUM-sized false-far patch - wide enough to survive the
+        pixel-level speckle erosion in _valid_mask (that only strips
+        blobs narrower than speckle_erode_px), but this module has no
+        other defense against it. The one thing that reliably tells it
+        apart from a real opening: a gap actually wide enough for the
+        robot (a doorway) spans MULTIPLE bins - it has at least one
+        neighbor bin that agrees it's open. An artifact blob narrower
+        than one bin doesn't. Downgrades a bin reading more than
+        profile_isolated_bin_margin farther than BOTH immediate
+        neighbors to the nearer of those two neighbors' own reading,
+        instead of trusting the outlier outright. A genuine multi-bin
+        gap is untouched - it always has at least one agreeing neighbor,
+        so the "isolated on both sides" condition never fires for it.
+        Only ever pulls a value DOWN (more cautious), never invents a
+        closer reading than what's actually there, and never touches a
+        bin next to a None (unknown) neighbor - nothing to corroborate
+        OR contradict with there, so it's left alone rather than
+        guessed at. Edge bins (index 0 and the last) have only one
+        neighbor and are left untouched for the same reason - one-sided
+        evidence is weaker, and the risk of suppressing a genuine
+        edge-of-doorway reading is higher than for an interior bin with
+        two neighbors to check against."""
+        n = len(profile)
+        if n < 3 or self.profile_isolated_bin_margin <= 0:
+            return profile
+        sanitized = list(profile)
+        for i in range(1, n - 1):
+            d, left, right = profile[i], profile[i - 1], profile[i + 1]
+            if d is None or left is None or right is None:
+                continue
+            neighbor_max = max(left, right)
+            if d > neighbor_max + self.profile_isolated_bin_margin:
+                sanitized[i] = neighbor_max
+        return sanitized
+
+    def _sanitize_zones(self, left, center, right):
+        """Cross-zone version of _sanitize_profile's "an isolated far
+        reading with no neighbour agreeing is probably an artifact" idea,
+        applied to the L/C/R zones - the SAFETY-CRITICAL path, which until
+        now had no equivalent protection at all (see far_fill_suspect_m in
+        __init__ for the field case that motivated this).
+
+        Deliberately narrow, because the thing it must NOT break is the
+        entire reason the far-mask exists: open sky and genuinely
+        far-away background must keep reading FAR, never "close obstacle".
+        Two properties guarantee that:
+
+          - it only ever fires on a reading at/above far_fill_suspect_m,
+            i.e. one that IS the synthetic fill constant rather than
+            anything the sensor actually measured;
+          - it only fires when a DIFFERENT zone has MEASURED something
+            closer than far_fill_contradiction_m, and the value it
+            substitutes in is that measured distance. It cannot invent a
+            close reading out of nothing.
+
+        So the open-field case - every zone far, whether by real
+        measurement or by fill - has nothing to contradict it and is
+        passed through completely untouched. Only the physically
+        implausible arrangement (one zone claiming 15m while a neighbour
+        genuinely measures 0.4m, i.e. a 15m corridor exactly one zone
+        wide between two close surfaces) gets pulled down.
+
+        The 0.0 centre fail-safe is deliberately NOT counted as evidence
+        of something close: it is itself a fail-value, not a measurement,
+        and letting it drag the side zones to 0.0 would be exactly the
+        "manufacture a phantom obstacle" behaviour this method promises
+        not to do. Only ever makes a reading more cautious, never less."""
+        zones = [left, center, right]
+        if not self.far_fill_suspect_m or self.far_fill_suspect_m <= 0:
+            return zones
+        suspect = [d is not None and d >= self.far_fill_suspect_m for d in zones]
+        if not any(suspect):
+            return zones
+        measured_close = [d for d in zones
+                          if d is not None and 0.0 < d < self.far_fill_contradiction_m]
+        if not measured_close:
+            return zones  # nothing contradicts - open sky / far background, leave alone
+        nearest = min(measured_close)
+        out = []
+        for d, is_suspect in zip(zones, suspect):
+            if is_suspect:
+                print(self.time, 'zone reading %.2fm looks like far-mask fill but another zone '
+                                  'measured %.2fm - downgrading (see _sanitize_zones)' % (d, nearest))
+                out.append(nearest)
+            else:
+                out.append(d)
+        return out
+
     def _depth_profile(self, data):
-        """free_space_bins distances across free_space_cols, same row
-        window (self.rows - already pitch-compensated) and same per-bin
-        _dist() logic as the L/C/R zones, just finer-grained. None for a
-        bin with too little valid data (same fail_value=None convention
-        as left/right - "unknown", not "assume worst", since this is only
-        ever used for a gradual steering nudge, never a hard stop)."""
+        """free_space_bins distances across free_space_cols x
+        free_space_rows (own pitch-compensated row window - see __init__
+        for why it's separate from, and normally taller than, self.rows)
+        and same per-bin _dist() logic as the L/C/R zones, just finer-
+        grained. None for a bin with too little valid data (same
+        fail_value=None convention as left/right - "unknown", not
+        "assume worst", since this is only ever used for a gradual
+        steering nudge, never a hard stop). Passed through
+        _sanitize_profile before returning - see that method."""
         c0, c1 = self.free_space_cols
         edges = np.linspace(c0, c1, self.free_space_bins + 1).astype(int)
-        return [self._dist(data, self.rows, (edges[i], edges[i + 1]), fail_value=None)
-                for i in range(self.free_space_bins)]
+        profile = [self._dist(data, self.free_space_rows, (edges[i], edges[i + 1]), fail_value=None)
+                   for i in range(self.free_space_bins)]
+        return self._sanitize_profile(profile)
 
     def _ground_reading(self, data):
         r0, r1 = self.ground_rows
         c0, c1 = self.ground_cols
-        selection = data[r0:r1, c0:c1]
-        mask = selection > 0
+        selection, mask = self._process(data[r0:r1, c0:c1])
         valid_frac = float(mask.mean())
         if valid_frac < self.min_valid_frac:
             return valid_frac, None
@@ -510,6 +782,10 @@ class ObstacleDetector3DZones(Node):
         center = self._dist(data, self.rows, self.center_cols, fail_value=0.0)  # preserve old fail-safe
         left = self._dist(data, self.rows, self.left_cols, fail_value=None)
         right = self._dist(data, self.rows, self.right_cols, fail_value=None)
+        # drop synthetic far-mask fill that a neighbouring zone contradicts,
+        # BEFORE anything downstream (hard stop, turn-side choice, and - via
+        # the consumer's scan_samples - best-heading scoring) sees it
+        left, center, right = self._sanitize_zones(left, center, right)
         self.publish('obstacle_zones', [left, center, right])
         self.publish('depth_profile', self._depth_profile(data))
 

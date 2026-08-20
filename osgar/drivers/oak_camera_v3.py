@@ -165,6 +165,51 @@ class OakCamera:
         self.threshold_filter_min_mm = config.get("stereo_threshold_filter_min_mm")
         self.threshold_filter_max_mm = config.get("stereo_threshold_filter_max_mm")
 
+        # Far-distance mask - host-side (NOT an OAK/StereoDepth setting),
+        # applied to every published depth frame in run_input below. An
+        # invalid (0mm) reading is ambiguous: the sensor gives the exact
+        # same "no return" code whether something is too CLOSE (below
+        # stereo min range) or too FAR (beyond max range / no return at
+        # all - open sky, a long hallway). In the upper part of the
+        # frame - away from the ground, where a normal-height obstacle
+        # would actually show up - invalid far more often means "too
+        # far", so it's remapped to depth_far_mask_value_mm (a definite
+        # large distance) instead of being left at 0/invalid, giving
+        # downstream obstacle detection a "clear" reading there rather
+        # than an "unknown" one for what is, in the ordinary case,
+        # genuinely open space.
+        #
+        # depth_far_mask_col_margin excludes this many columns from BOTH
+        # the left and right edges of that remapping (0 = no exclusion,
+        # the original behaviour, masking the full row width). Field-
+        # reported failure mode: a wall close to the camera at a
+        # shallow/oblique angle - most likely right at the LEFT/RIGHT
+        # edges of the frame, e.g. squeezing through a narrow doorway -
+        # is also a common cause of invalid readings, and for THAT case
+        # "assume far" is exactly the wrong assumption; it made a nearby
+        # wall look like open space to downstream logic (obstdet3d_zones'
+        # outermost free_space_cols bins in particular, which sit right
+        # at those columns). Excluding the outer columns leaves an
+        # invalid reading there as 0/invalid instead, so obstdet3d_zones'
+        # own min_valid_frac/fail_value handling - already built for
+        # exactly this near-vs-far ambiguity - decides what to do with it
+        # instead of it being silently pre-decided as "far" here, before
+        # that logic ever sees it.
+        #
+        # None of this is calibrated - depth_far_mask_max_row=300/
+        # depth_far_mask_value_mm=15000 are whatever this already shipped
+        # with (undocumented, previously hardcoded); depth_far_mask_col_
+        # margin is new and defaults to 0 (old behaviour) unless set.
+        # depth_far_mask_max_row=0 disables the masking entirely.
+        self.depth_far_mask_max_row = config.get("depth_far_mask_max_row", 300)
+        self.depth_far_mask_col_margin = config.get("depth_far_mask_col_margin", 0)
+        self.depth_far_mask_value_mm = config.get("depth_far_mask_value_mm", 15000)
+        # sanity gate on the fill above - see run_input. If more than
+        # this fraction of the region is invalid, treat it as a likely
+        # sensor dropout (sun glare, occlusion) rather than "genuinely
+        # far", and leave it at 0/invalid instead of filling it in.
+        self.depth_far_mask_max_invalid_frac = config.get("depth_far_mask_max_invalid_frac", 0.85)
+
         # SIPP (Signal Image Processing Pipeline) memory pool - shared on-chip
         # buffer used by ISP, mono-camera Warp/rectification, AND the stereo
         # median filter. Bump this if you hit "'Median' out of system
@@ -582,8 +627,38 @@ class OakCamera:
                         self.bus.publish("depth_seq", [seq_num, timestamp_us])
                         frame = depth_frame.getCvFrame()
                         frame_cp = frame.copy()
-                        upper = frame_cp[:300]
-                        upper[upper == 0] = 15000
+                        if self.depth_far_mask_max_row > 0:
+                            # see depth_far_mask_* in __init__ for the
+                            # full rationale, incl. why the column margin
+                            # exists
+                            margin = self.depth_far_mask_col_margin
+                            c1 = frame_cp.shape[1] - margin if margin > 0 else frame_cp.shape[1]
+                            region = frame_cp[:self.depth_far_mask_max_row, margin:c1]
+                            # Field-caught failure mode (direct sunlight on
+                            # a glossy wall): sunlight's own IR content can
+                            # overwhelm the projector's structured-light
+                            # pattern badly enough that almost the ENTIRE
+                            # region reads invalid at once - not the
+                            # "mostly valid, a few far/out-of-range gaps"
+                            # case this masking exists for. Blindly filling
+                            # 0 -> depth_far_mask_value_mm there turns a
+                            # total sensor blackout into the single most
+                            # confident-looking "clear" reading possible
+                            # (every pixel agreeing on a specific distance)
+                            # - exactly backwards, and worse than doing
+                            # nothing: obstdet3d_zones' own min_valid_frac/
+                            # fail_value handling (built for exactly this
+                            # kind of degraded-data situation) never even
+                            # gets a chance to see it, because by the time
+                            # it looks, the region reads as 100% valid.
+                            # Skip the fill when too much of the region is
+                            # already invalid - leave it at 0 so that
+                            # existing fail-safe handling downstream sees
+                            # what actually happened (mass invalid data)
+                            # instead of a manufactured "all clear".
+                            invalid_frac = float((region == 0).mean()) if region.size else 0.0
+                            if invalid_frac <= self.depth_far_mask_max_invalid_frac:
+                                region[region == 0] = self.depth_far_mask_value_mm
                         self.bus.publish("depth", frame_cp)
 
                 # 3. Check Visual Odom
@@ -623,7 +698,21 @@ class OakCamera:
                     if qr_frames and len(qr_frames) > 0:
                         processed_any = True
                         frame = qr_frames[-1].getCvFrame()
-                        text, points, _ = qr_detector.detectAndDecode(frame)
+                        try:
+                            text, points, _ = qr_detector.detectAndDecode(frame)
+                        except cv2.error as e:
+                            # cv2.QRCodeDetector.detectAndDecode() can THROW
+                            # instead of returning empty when detect() finds
+                            # a degenerate (zero-area) candidate region -
+                            # documented OpenCV flakiness, not specific to
+                            # this driver/config. Left uncaught, this killed
+                            # the WHOLE run_input thread - not just QR
+                            # reading, but depth/IMU/NN detections too, since
+                            # they're all processed in this same loop above.
+                            # A single bad camera frame must not take the
+                            # entire sensor pipeline down - log and skip it.
+                            g_logger.warning('QR detectAndDecode failed on this frame, skipping: %s', e)
+                            text = None
                         if text:
                             if text != last_qr_text:
                                 # a code sitting in view decodes fresh every

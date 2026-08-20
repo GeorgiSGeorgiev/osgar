@@ -52,3 +52,6 @@ Tulak Obstacle V1:
    5. GPS still unstable (mainly under trees)- the circle situation
    6. Maybe there is too much smoothness - Matty slows down too often
    7. Bumpers fixed, now they behave more like bumpers, actually stopping the actions.
+
+Tulak Obstacle V2:
+
