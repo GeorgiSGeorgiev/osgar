@@ -51,6 +51,23 @@
   clearance, meant to run well before the discrete avoidance state
   machine's threshold, not replace it).
 
+  --- Trusting a window, and what happens when you can't ---
+
+  Two gates decide whether a window's reading is believable at all:
+  min_valid_frac (enough non-zero pixels) and min_real_frac (enough of
+  them GENUINELY MEASURED rather than far-mask fill - see __init__).
+  A window failing either reports its fail value: None for the sides
+  ("unknown", read as far), and center_fail_dist_m for the centre.
+
+  center_fail_dist_m is a deliberate risk dial, not a tuning knob. At
+  0.0 a blank centre reads as an obstacle at zero distance and stops the
+  robot - maximum safety. Raised above the highest turning_dist the
+  consumer can reach, missing data stops nothing, which is what a
+  competition run may want and is exactly the protection that lets a
+  close obstacle which has stopped returning stereo be driven into.
+  Consumers must not test the published value against 0.0 to detect
+  missing data once this is configurable.
+
   --- Synthetic far-fill cross-check ---
 
   oak_camera_v3.py remaps invalid pixels in the upper frame to a large
@@ -276,7 +293,9 @@
   pattern already used for obstacles lives in the consuming node
   instead, for consistency).
 """
+import datetime
 import math
+from collections import deque
 
 import cv2
 import numpy as np
@@ -310,6 +329,118 @@ class ObstacleDetector3DZones(Node):
 
         self.percentile = config.get('percentile', 5)  # 0 = classic min, like the original
         self.min_valid_frac = config.get('min_valid_frac', 0.05)
+
+        # --- minimum GENUINELY MEASURED data (see _dist) ---
+        # oak_camera_v3's far-mask rewrites invalid pixels in the upper
+        # frame to far_fill_value_mm so that sky reads as "far" instead of
+        # tripping min_valid_frac's fail-safe and freezing the robot. That
+        # remap is necessary and stays. Its flaw is that a window can then
+        # pass min_valid_frac on fill alone - the fill counts as valid -
+        # so a window containing NO measurement whatsoever reports a
+        # confident large distance.
+        #
+        # Field case (2026-08-29 run 125548, frontal collision at
+        # 0.46m/s): an obstacle closing on the camera progressively
+        # stopped returning stereo - real pixels in the centre window went
+        # 51% -> 39% -> 8.8% -> 0.0% over one second - and once at zero the
+        # window was 100% fill and read 15.00m. Not the far-mask erasing a
+        # visible obstacle; the far-mask supplying confidence where there
+        # was no longer any data at all.
+        #
+        # min_real_frac requires a floor of genuinely measured pixels
+        # before any reading is trusted. Deliberately LOW, because the
+        # legitimate sky case does not come anywhere near it: measured
+        # over healthy Stromovka runs the centre window is 44-55% real
+        # ground pixels (it sits below the horizon by design), and frames
+        # under 2% real occur in only 0.8-2.8% of a healthy run - versus
+        # 76.3% of the run where the camera genuinely saw nothing. So this
+        # does NOT re-break the "sky above the horizon makes the robot
+        # refuse to drive" case the far-mask exists to solve.
+        # 0 disables the check.
+        # Applied to the depth_profile BINS, whose consumer treats an
+        # unknown bin as unknown (never as an obstacle) and which is what
+        # the blind detector reads - so tightening it here costs nothing
+        # and is what lets "the camera sees nothing anywhere" be noticed.
+        self.min_real_frac = config.get('min_real_frac', 0.02)
+        # Applied to the L/C/R ZONES. Defaults to 0 (off) DELIBERATELY,
+        # unlike the profile above, because these feed the hard-stop and
+        # avoidance triggers and the same sensor condition means different
+        # things in different places. Measured across frames where the
+        # centre window held no real pixels at all:
+        #     doorway run  - a side zone still saw real data 52.9% of the
+        #                    time; nothing anywhere only 47.1%
+        #     crash run    - a side saw real data 1.7%; nothing anywhere
+        #                    92.3%
+        # So a blank centre alone does NOT identify the dangerous case,
+        # and rejecting on it re-decides carefully tuned doorway
+        # behaviour: switching this on changed 31 of 259 doorway frames
+        # and up to 77deg of commanded steering. The dangerous case is
+        # "nothing anywhere", which the blind detector catches through the
+        # profile and ground band instead - at no cost to the zones.
+        # Raise this only if you intend to re-tune close-quarters
+        # behaviour with it on.
+        self.min_real_frac_zones = config.get('min_real_frac_zones', 0.0)
+        # must match the oak module's depth_far_mask_value_mm
+        self.far_fill_value_mm = config.get('far_fill_value_mm', 15000)
+
+        # --- how hard the centre fail-safe bites (item: fail-safe level) ---
+        # What the CENTRE zone reports when its window cannot be trusted -
+        # too little valid data (min_valid_frac) or too little genuinely
+        # measured data (min_real_frac). The sides already report None
+        # ("unknown", treated as far) and are unaffected.
+        #
+        #   0.0  - an obstacle at zero distance. Any consumer stops
+        #          immediately. Maximum safety, the original behaviour.
+        #   1.5  - "assume this much room". Above every threshold the
+        #          consumer actually uses at Matty's speeds (turning_dist
+        #          settles near 0.9), so missing data stops nothing - but
+        #          it still feeds the adaptive-speed calculation, so the
+        #          robot slows rather than charging blind.
+        #   >3.0 - above turning_dist's ceiling: missing data produces no
+        #          reaction of any kind.
+        #
+        # This is a genuine risk dial, not a tuning parameter. Raising it
+        # trades away exactly the protection that min_real_frac above
+        # exists to provide: in the 2026-08-29 run 125548 collision, the
+        # centre window lost all real pixels one second before impact, and
+        # it is this fail value that decides whether that second is spent
+        # stopping or driving. Whoever raises it is accepting that
+        # outcome deliberately.
+        #
+        # Consumers must NOT test for 0.0 to detect "no data" once this is
+        # configurable - on_depth publishes the fact separately, see below.
+        self.center_fail_dist_m = config.get('center_fail_dist_m', 0.0)
+
+        # --- context-dependent fail-safe (open ground vs tight quarters) ---
+        # One fail distance cannot serve both. Relaxing it stops the robot
+        # from braking on missing data in the open, which is what a
+        # competition run wants - but in tight quarters the SAME relaxation
+        # silently removes most of the avoidance, because there the
+        # fail-safe is not a rare safety net, it is doing the steering.
+        # Measured on the 2026-08-29 park run (poles), comparing fail 0.0
+        # against 1.2 everywhere: 595 commands changed and avoidance
+        # episodes fell 59 -> 13, with 64.5% of those changes happening
+        # while something had recently been measured within 2m (33.9%
+        # within 1m) - i.e. squarely in the tight passages, not in the open
+        # stretches the relaxation was meant for.
+        #
+        # So the fail distance is chosen per frame from how enclosed the
+        # robot has recently been: the smallest GENUINELY MEASURED zone
+        # distance over the last center_fail_recent_window_sec. That is
+        # history, not the current frame - the whole problem is that the
+        # current frame has no usable data, and the side zones are no help
+        # either (in that same run, 98.3% of centre-fail frames had both
+        # sides far/unknown too, making a doorway look exactly like open
+        # ground).
+        #
+        # center_fail_dist_open_m defaults to center_fail_dist_m, i.e. no
+        # context switching at all unless explicitly configured.
+        self.center_fail_dist_open_m = config.get('center_fail_dist_open_m',
+                                                  self.center_fail_dist_m)
+        self.center_fail_open_recent_dist_m = config.get('center_fail_open_recent_dist_m', 2.0)
+        self.center_fail_recent_window = datetime.timedelta(
+            seconds=config.get('center_fail_recent_window_sec', 5.0))
+        self._recent_measured = deque()  # (time, smallest measured zone distance)
 
         # --- synthetic far-fill cross-check (see _sanitize_zones) ---
         # oak_camera_v3.py's depth_far_mask_* remaps invalid pixels in the
@@ -650,11 +781,54 @@ class ObstacleDetector3DZones(Node):
             mask = cv2.erode(mask.astype(np.uint8), self._erode_kernel).astype(bool)
         return selection, mask
 
-    def _dist(self, data, rows, cols, fail_value):
+    def _track_recent_measured(self, *zones):
+        """Remember the smallest GENUINELY MEASURED zone distance per frame,
+        over a trailing window - see the context-dependent fail-safe notes
+        in __init__. Fill values and fail substitutes are excluded: only
+        something the sensor actually saw counts as evidence of being
+        enclosed."""
+        far_m = self.far_fill_value_mm / 1000.0
+        measured = [d for d in zones if d is not None and 0.0 < d < far_m]
+        if measured:
+            self._recent_measured.append((self.time, min(measured)))
+        while (self._recent_measured
+               and self.time - self._recent_measured[0][0] > self.center_fail_recent_window):
+            self._recent_measured.popleft()
+
+    def _center_fail_value(self):
+        """Which fail distance applies right now - the strict one in tight
+        quarters, the relaxed one in the open. Nothing measured recently at
+        all counts as OPEN: that is the camera seeing nothing rather than
+        the robot being boxed in, and it is the blind detector's job (which
+        looks at the profile and the ground band, independently of this)."""
+        if self.center_fail_dist_open_m == self.center_fail_dist_m:
+            return self.center_fail_dist_m          # context switching not configured
+        if not self._recent_measured:
+            return self.center_fail_dist_open_m
+        recent = min(d for _, d in self._recent_measured)
+        if recent < self.center_fail_open_recent_dist_m:
+            return self.center_fail_dist_m          # enclosed - keep the strict fail-safe
+        return self.center_fail_dist_open_m
+
+    def _real_mask(self, selection, mask):
+        """Valid pixels that are an actual measurement, i.e. excluding
+        far-mask fill - see min_real_frac in __init__."""
+        if not self.far_fill_value_mm:
+            return mask
+        return mask & (selection < self.far_fill_value_mm)
+
+    def _dist(self, data, rows, cols, fail_value, min_real_frac=None):
         r0, r1 = rows
         c0, c1 = cols
         selection, mask = self._process(data[r0:r1, c0:c1])
         if mask.mean() < self.min_valid_frac:
+            return fail_value
+        if min_real_frac is None:
+            min_real_frac = self.min_real_frac
+        if min_real_frac > 0 and self._real_mask(selection, mask).mean() < min_real_frac:
+            # window is essentially all synthetic fill - no measurement at
+            # all behind it, so it must not be reported as a distance. See
+            # min_real_frac in __init__.
             return fail_value
         return float(np.percentile(selection[mask], self.percentile) / 1000)
 
@@ -696,7 +870,7 @@ class ObstacleDetector3DZones(Node):
                 sanitized[i] = neighbor_max
         return sanitized
 
-    def _sanitize_zones(self, left, center, right):
+    def _sanitize_zones(self, left, center, right, center_failed=False):
         """Cross-zone version of _sanitize_profile's "an isolated far
         reading with no neighbour agreeing is probably an artifact" idea,
         applied to the L/C/R zones - the SAFETY-CRITICAL path, which until
@@ -734,8 +908,12 @@ class ObstacleDetector3DZones(Node):
         suspect = [d is not None and d >= self.far_fill_suspect_m for d in zones]
         if not any(suspect):
             return zones
-        measured_close = [d for d in zones
-                          if d is not None and 0.0 < d < self.far_fill_contradiction_m]
+        # a substituted centre fail distance is not a measurement and must
+        # never be used as evidence that something is close (it would drag
+        # a genuine far side down with it) - same reason 0.0 was excluded
+        measured_close = [d for i, d in enumerate(zones)
+                          if d is not None and 0.0 < d < self.far_fill_contradiction_m
+                          and not (i == 1 and center_failed)]
         if not measured_close:
             return zones  # nothing contradicts - open sky / far background, leave alone
         nearest = min(measured_close)
@@ -769,6 +947,13 @@ class ObstacleDetector3DZones(Node):
         r0, r1 = self.ground_rows
         c0, c1 = self.ground_cols
         selection, mask = self._process(data[r0:r1, c0:c1])
+        # count only genuine measurements: ground_rows normally sits below
+        # the far-mask's row limit so no fill reaches here, but this stays
+        # correct if that limit is ever raised - and the consumer now uses
+        # this fraction as its "is the camera seeing anything at all?"
+        # signal (see tulak_obstacle's _update_blind_state), which fill
+        # would otherwise answer falsely
+        mask = self._real_mask(selection, mask)
         valid_frac = float(mask.mean())
         if valid_frac < self.min_valid_frac:
             return valid_frac, None
@@ -779,20 +964,34 @@ class ObstacleDetector3DZones(Node):
         self.smoothed_pitch += self.pitch_smoothing_alpha * (self.pitch - self.smoothed_pitch)
         self._maybe_update_rows(data.shape[0])
 
-        center = self._dist(data, self.rows, self.center_cols, fail_value=0.0)  # preserve old fail-safe
-        left = self._dist(data, self.rows, self.left_cols, fail_value=None)
-        right = self._dist(data, self.rows, self.right_cols, fail_value=None)
+        # ask for None so an untrusted centre is DISTINGUISHABLE from a real
+        # measurement, then substitute the configured fail distance - see
+        # center_fail_dist_m. Testing the published number against 0.0 would
+        # stop working the moment that value is changed.
+        # zones use min_real_frac_zones (0 by default - see __init__ for why
+        # they are deliberately NOT held to the profile's stricter bar)
+        zmr = self.min_real_frac_zones
+        center_raw = self._dist(data, self.rows, self.center_cols, fail_value=None, min_real_frac=zmr)
+        center_failed = center_raw is None
+        left = self._dist(data, self.rows, self.left_cols, fail_value=None, min_real_frac=zmr)
+        right = self._dist(data, self.rows, self.right_cols, fail_value=None, min_real_frac=zmr)
+        self._track_recent_measured(center_raw, left, right)
+        center = self._center_fail_value() if center_failed else center_raw
         # drop synthetic far-mask fill that a neighbouring zone contradicts,
         # BEFORE anything downstream (hard stop, turn-side choice, and - via
         # the consumer's scan_samples - best-heading scoring) sees it
-        left, center, right = self._sanitize_zones(left, center, right)
+        left, center, right = self._sanitize_zones(left, center, right, center_failed)
         self.publish('obstacle_zones', [left, center, right])
         self.publish('depth_profile', self._depth_profile(data))
 
         ground_valid_frac, ground_dist = self._ground_reading(data)
         ground_bad = (ground_valid_frac < self.min_valid_frac) or \
                       (ground_dist is not None and ground_dist > self.max_ground_dist)
-        if ground_bad and center < self.near_object_suppress_dist:
+        # center_failed is the direct equivalent of the old "centre reads
+        # 0.0" test - a blanked centre is exactly the pressed-against-an-
+        # object case this suppression exists for, and it must keep working
+        # whatever center_fail_dist_m is set to
+        if ground_bad and (center_failed or center < self.near_object_suppress_dist):
             print(self.time, 'ground reading looks bad but center is very close (%.2fm) - '
                               'treating as a close obstacle, not a ground hazard' % center)
             ground_hazard = False

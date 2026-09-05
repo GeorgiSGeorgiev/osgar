@@ -209,6 +209,14 @@ class OakCamera:
         # sensor dropout (sun glare, occlusion) rather than "genuinely
         # far", and leave it at 0/invalid instead of filling it in.
         self.depth_far_mask_max_invalid_frac = config.get("depth_far_mask_max_invalid_frac", 0.85)
+        # Second half of that gate, and the one that makes it mean
+        # something outdoors: the fill is only withheld when the LOWER
+        # frame (below depth_far_mask_max_row, i.e. the ground ahead) is
+        # also dead. An empty upper region on its own is just sky - see
+        # the measurements in run_input. 0 restores the old
+        # invalid_frac-only behaviour.
+        self.depth_far_mask_min_lower_valid_frac = config.get(
+            "depth_far_mask_min_lower_valid_frac", 0.10)
 
         # SIPP (Signal Image Processing Pipeline) memory pool - shared on-chip
         # buffer used by ISP, mono-camera Warp/rectification, AND the stereo
@@ -656,8 +664,38 @@ class OakCamera:
                             # existing fail-safe handling downstream sees
                             # what actually happened (mass invalid data)
                             # instead of a manufactured "all clear".
+                            #
+                            # ...but that invalid fraction ALONE cannot
+                            # tell a sensor blackout from open sky, and
+                            # outdoors it is dominated by sky. Measured
+                            # over the 2026-09-04 CZU runs, the fraction
+                            # sits at 0.85-0.95 in ordinary daylight -
+                            # straddling the threshold - so the fill
+                            # flickered on and off frame to frame and the
+                            # centre zone kept collapsing to its fail
+                            # value with nothing actually wrong. Across
+                            # 3213 skipped frames the LOWER frame (below
+                            # this region, where the ground is) was 96%
+                            # valid at the median, and healthy in 96.6% of
+                            # them: the camera was working every time.
+                            #
+                            # So the blackout test now needs BOTH: the
+                            # region mostly invalid AND the lower frame
+                            # dead too. That is the same discriminator
+                            # obstdet3d_zones already uses for the blind
+                            # hold (blind_ground_valid_frac) - the ground
+                            # a metre ahead is present in every scene the
+                            # robot can drive in, so if it still returns
+                            # data, this is sky and not blindness. The
+                            # genuine blackouts in those same logs (the
+                            # indoor/covered runs) had a lower frame at
+                            # 0.00 valid and are still caught.
                             invalid_frac = float((region == 0).mean()) if region.size else 0.0
-                            if invalid_frac <= self.depth_far_mask_max_invalid_frac:
+                            lower = frame_cp[self.depth_far_mask_max_row:, margin:c1]
+                            lower_valid_frac = float((lower > 0).mean()) if lower.size else 0.0
+                            blackout = (invalid_frac > self.depth_far_mask_max_invalid_frac
+                                        and lower_valid_frac < self.depth_far_mask_min_lower_valid_frac)
+                            if not blackout:
                                 region[region == 0] = self.depth_far_mask_value_mm
                         self.bus.publish("depth", frame_cp)
 
