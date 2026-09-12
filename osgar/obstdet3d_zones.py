@@ -292,6 +292,48 @@
   boolean, no debouncing here - the same close_confirm-style streak
   pattern already used for obstacles lives in the consuming node
   instead, for consistency).
+
+  --- The same band, read the other way: near/low obstacles ---
+
+  The ground check above only ever asks whether the floor is FARTHER
+  than expected. Field evidence says the opposite question is the more
+  valuable one, and nothing was asking it.
+
+  Two things conspire to make an obstacle right in front of the robot
+  invisible to every other channel in this module:
+
+    - the stereo has a near limit. Measured over the 2026-09-05 runs,
+      NOTHING is ever returned closer than 0.30m, and only 1.9% of all
+      pixels fall inside 0.7m. An object that gets closer than that
+      stops being measured at all - its pixels go invalid, and the
+      window's percentile falls back onto whatever ground or background
+      is still visible past it. The reading does not get closer as the
+      obstacle approaches; it gets STALER.
+    - the obstacle band (`rows`) looks at roughly eye level. A kerb, a
+      step, a low wall or a bollard sits below it, and the far-mask
+      paints the sky above it as a confident 15m.
+
+  So the last thing that still sees an object about to be hit is the
+  GROUND band, because an object standing on the floor occupies the
+  floor's own pixels. And the ground band's reading on real ground is
+  remarkably stable - over 26746 samples from those runs, p25-p75 was
+  0.87-0.97m, p10 0.76m. A reading well under that is not a floor.
+
+  Measured against the actual front-bumper contacts in those runs, the
+  ground band fell from ~0.95m to 0.33-0.38m over roughly a second
+  before four of them - a clear, early, unambiguous warning that no
+  other channel gave. (It does NOT catch everything: a handrail struck
+  at 153832 passes over the ground band entirely, which is what the
+  obstacle band and the profile bins are for.)
+
+  min_ground_dist publishes that as ground_near, a fourth element of
+  the 'ground_hazard' message. Deliberately a separate flag rather than
+  folded into ground_hazard: the two want opposite reactions. A
+  drop-off means "do not drive forward, and do not assume backing up
+  helps"; a near obstacle is an ordinary close-obstacle event that the
+  consumer's avoidance state machine already knows how to resolve.
+  0 disables it (nothing published changes meaning; the field is simply
+  always False).
 """
 import datetime
 import math
@@ -571,6 +613,55 @@ class ObstacleDetector3DZones(Node):
         # not calibrated - loosen if genuine rough-terrain roll gets
         # rejected, tighten if turn-corrupted pitch still leaks through.
         self.max_plausible_roll_rad = math.radians(config.get('max_plausible_roll_deg', 30))
+        # The SAME fixed-mount correction pitch_offset_deg makes, for roll -
+        # and it is not optional once you look at the numbers. Measured on a
+        # genuinely level floor with the robot stationary (2026-09-06 run
+        # 145328, 3430 samples, 0.03 m of odometry drift): roll reads
+        # +27.7 deg, not 0. The IMU die simply does not sit square in the
+        # OAK-D Pro housing, exactly as it does not for pitch.
+        #
+        # Left uncorrected, max_plausible_roll_deg stops meaning what it
+        # says. A +-30 deg gate around a +27.7 deg baseline is +2.3 deg of
+        # headroom one way and +57.7 the other, so it rejected 16% of
+        # samples with the robot standing still on a flat floor - and would
+        # reject nearly everything on terrain that rolls the chassis a few
+        # degrees the wrong way, silently freezing the depth RoI at
+        # whatever pitch it last trusted. Subtracted before the gate below,
+        # so the guard is once again symmetric about level.
+        self.roll_offset_rad = math.radians(config.get('roll_offset_deg', 0))
+        # --- how pitch and roll are extracted from the quaternion ---
+        # 'euler' (default, previous behaviour): aerospace ZYX angles.
+        # 'gravity': the tilt of the gravity vector in the IMU body frame,
+        #            which has no singularity near the working point.
+        #
+        # Why 'euler' broke. ZYX pitch is asin() and lives in [-90, 90]
+        # degrees; at +-90 it is the gimbal-lock singularity, where roll and
+        # yaw become degenerate. The OAK's IMU die sits in the housing with
+        # its body x-axis along gravity, and re-aiming the camera to level
+        # (2026-09-06) put the raw pitch at 89.3 deg - 0.7 deg from that
+        # singularity. Measured on the 2026-09-11 ramp run 172231:
+        #   - pitch FOLDS: it reads 90 - |tilt|, so nose-up and nose-down
+        #     are indistinguishable; on the decline it read 83-86 deg,
+        #     which would move the window the wrong way
+        #   - roll swings wildly (+61 -> -17 -> -173 -> +179 deg) because at
+        #     gimbal lock it no longer means anything, so the plausibility
+        #     gate rejected 63% of batches - the entire decline included -
+        #     and the pitch froze at its last accepted value
+        # That is the reported "the windows didn't move with the decline".
+        #
+        # 'gravity' instead measures the world 'up' vector in the body
+        # frame and takes its angle within the two planes that contain
+        # the body's near-vertical axis: nose pitch and lateral lean. On
+        # the same ramp it tracks cleanly, +0.3 deg level to -5..-6.5 deg
+        # on the decline and back. Offsets are re-captured in these units:
+        # on the 2026-09-06 level-floor log (145328) the tilt reads +0.58
+        # and the lean +0.30 deg. Nose-UP is positive here, so it takes
+        # pitch_shift_sign=+1 (nose up -> window down), matching the
+        # camera_tilt_deg convention.
+        self.pitch_source = config.get('pitch_source', 'euler')
+        # which body axis points DOWN gravity when the camera is level
+        # (measured up vector on the level floor: (-0.9999, +0.005, +0.010))
+        self.imu_down_axis = config.get('imu_down_axis', 'x')
         # rotationVectorAccuracy (see on_orientation_list) is the BNO08x's
         # own ESTIMATED ORIENTATION ERROR, in radians - LOWER is better,
         # the opposite sense its name suggests. Samples above this are
@@ -587,6 +678,10 @@ class ObstacleDetector3DZones(Node):
         self._pitch_initialized = False  # see on_orientation_list - snap instead of EMA-ramp on the first reading
         self.applied_shift_px = 0.0
         self.rows = self.base_rows
+        # see _maybe_update_rows - how long the dynamic shift may sit at
+        # its clamp before saying so. 50 frames is 5s at 10fps.
+        self.clamp_warn_frames = config.get('clamp_warn_frames', 50)
+        self._clamped_frames = 0
 
         # depth_profile's own row window - defaults to base_rows (the
         # same band the L/C/R zones use) for backward compatibility, but
@@ -614,6 +709,39 @@ class ObstacleDetector3DZones(Node):
         self.ground_base_rows = tuple(config.get('ground_rows', [370, 395]))
         self.ground_cols = tuple(config.get('ground_cols', list(self.center_cols)))
         self.max_ground_dist = config.get('max_ground_dist', 1.0)
+        # ...and the same band read the other way round - see the
+        # "near/low obstacles" section of the module docstring. This is
+        # the only channel that still sees a kerb, a step or a bollard
+        # once it is inside the stereo's own near limit. Anchor it well
+        # below the measured p10 of real ground (0.76m) so ordinary
+        # pitch/terrain variation cannot reach it; 0 disables.
+        self.min_ground_dist = config.get('min_ground_dist', 0.0)
+        # ...and the same test expressed RELATIVE to whatever this band
+        # normally reads, which is what makes it survive the camera being
+        # re-aimed.
+        #
+        # The absolute threshold above is only meaningful against a known
+        # mounting: it was picked from a measured p50 of 0.94m with the
+        # camera tilted 7.5deg up, and tilting the camera down to level
+        # moves that same band to about 0.68m - close enough to 0.60 that
+        # the absolute test would fire on ordinary ground. Every future
+        # change to camera_tilt_deg, ground_rows or mount height has the
+        # same problem, and re-deriving a constant by hand each time is
+        # exactly the step that gets skipped.
+        #
+        # So the band also learns what "normal floor" looks like: a
+        # running median over ground_baseline_frames of its own ACCEPTED
+        # readings (a flagged reading never teaches, so an obstacle the
+        # robot is slowly approaching cannot drag the baseline down with
+        # it). A reading below ground_min_frac of that baseline is a
+        # near obstacle whatever the geometry happens to be.
+        #
+        # Both tests apply, and the LARGER threshold wins - the absolute
+        # one as a floor for the case where the baseline is not yet
+        # established or the whole band is looking at something wrong.
+        # ground_min_frac=0 disables the relative test.
+        self.ground_min_frac = config.get('ground_min_frac', 0.0)
+        self._ground_baseline = deque(maxlen=config.get('ground_baseline_frames', 100))
         self.near_object_suppress_dist = config.get('near_object_suppress_dist', 0.3)
         self.ground_rows = self.ground_base_rows
 
@@ -637,6 +765,31 @@ class ObstacleDetector3DZones(Node):
         pitch = math.asin(sin_pitch)
         yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
         return roll, pitch, yaw
+
+    def _gravity_tilt(self, w, x, y, z):
+        """(lean, tilt, yaw) in radians from the gravity vector in the IMU
+        body frame - see pitch_source in __init__. Singularity-free as long
+        as imu_down_axis stays within ~90 deg of vertical, which it always
+        does on a ground robot.
+
+        'up' is the world z-axis expressed in body coordinates, i.e. the
+        third row of the body->world rotation matrix. With the down axis
+        along body x, nose pitch rotates 'up' within the x-z plane and
+        lateral lean within the x-y plane; each is read with atan2, so
+        there is no asin ceiling to fold against. Yaw is not observable
+        from gravity and is returned from the Euler decomposition only
+        for the diagnostic print."""
+        up = (2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y))
+        if self.imu_down_axis == 'x':
+            vertical, pitch_c, lean_c = -up[0], up[2], up[1]
+        elif self.imu_down_axis == 'y':
+            vertical, pitch_c, lean_c = -up[1], up[2], up[0]
+        else:
+            vertical, pitch_c, lean_c = -up[2], up[0], up[1]
+        tilt = math.atan2(pitch_c, vertical)
+        lean = math.atan2(lean_c, vertical)
+        _roll, _pitch, yaw = self._quat_to_rpy(w, x, y, z)
+        return lean, tilt, yaw
 
     def on_orientation_list(self, data):
         """data: batched samples from the OAK-D Pro's own onboard IMU (see
@@ -675,14 +828,17 @@ class ObstacleDetector3DZones(Node):
         for timestamp, error_rad, i, j, k, real in reversed(data):
             if error_rad > self.max_pitch_error_rad:
                 continue
-            roll, raw_pitch, yaw = self._quat_to_rpy(real, i, j, k)
+            if self.pitch_source == 'gravity':
+                roll, raw_pitch, yaw = self._gravity_tilt(real, i, j, k)
+            else:
+                roll, raw_pitch, yaw = self._quat_to_rpy(real, i, j, k)
             # last_roll/last_yaw/last_raw_pitch are updated here regardless
             # of the plausibility check below, so a corrupted reading is
             # still VISIBLE in the verbose log/HUD for debugging - only
             # self.pitch (the value that actually drives the shift) is
             # withheld from a sample that fails it.
             self.last_roll, self.last_raw_pitch, self.last_yaw = roll, raw_pitch, yaw
-            if abs(roll) > self.max_plausible_roll_rad:
+            if abs(roll - self.roll_offset_rad) > self.max_plausible_roll_rad:
                 # see max_plausible_roll_rad in __init__ - a corrupted
                 # fused orientation (typically mid-turn) poisons pitch too,
                 # since both come from the same quaternion. Try the next
@@ -730,6 +886,25 @@ class ObstacleDetector3DZones(Node):
         static_shift_px = math.radians(self.camera_tilt_deg) * px_per_rad
 
         target_shift_px = dynamic_shift_px + static_shift_px
+
+        # A dynamic shift sitting at its clamp is not a steep ramp, it is
+        # almost always a wrong pitch_offset_deg - the RoI then rides at
+        # the top or bottom of the frame and the zones watch sky or the
+        # robot's own ground instead of obstacle height. It is silent
+        # otherwise, and it is the first thing that breaks after the
+        # camera is re-aimed, so say so.
+        if abs(raw_dynamic_shift_px) >= max_dynamic_shift_px - 0.5:
+            self._clamped_frames += 1
+            if self._clamped_frames == self.clamp_warn_frames:
+                print(self.time, 'WARNING: depth RoI pitch shift has been pinned at its '
+                                  '+-%.0f deg clamp for %d frames (smoothed pitch %.1f deg, '
+                                  'pitch_offset_deg %.1f). This is what a wrong pitch_offset_deg '
+                                  'looks like - rest the robot on a level surface, read '
+                                  'pitch_raw_deg, and set that as pitch_offset_deg.'
+                       % (self.max_pitch_shift_deg, self._clamped_frames,
+                          math.degrees(self.smoothed_pitch), math.degrees(self.pitch_offset_rad)))
+        else:
+            self._clamped_frames = 0
 
         if abs(target_shift_px - self.applied_shift_px) < self.min_shift_change_px:
             return  # not a real change - keep the current window, skip the log
@@ -997,7 +1172,26 @@ class ObstacleDetector3DZones(Node):
             ground_hazard = False
         else:
             ground_hazard = ground_bad
-        self.publish('ground_hazard', [ground_hazard, round(ground_valid_frac, 3), ground_dist])
+        # Something standing where the floor should be - see the module
+        # docstring. Independent of ground_hazard above (they want
+        # opposite reactions) and published alongside it rather than as
+        # its own topic, so no config rewiring is needed. Consumers that
+        # predate this unpack three elements; anything reading the fourth
+        # must tolerate its absence on older logs.
+        near_threshold = self.min_ground_dist
+        if self.ground_min_frac > 0 and len(self._ground_baseline) >= self._ground_baseline.maxlen // 2:
+            baseline = sorted(self._ground_baseline)[len(self._ground_baseline) // 2]
+            near_threshold = max(near_threshold, baseline * self.ground_min_frac)
+        ground_near = (near_threshold > 0 and ground_dist is not None
+                       and ground_dist < near_threshold)
+        if ground_dist is not None and not ground_near:
+            # only unflagged readings teach the baseline - see ground_min_frac
+            self._ground_baseline.append(ground_dist)
+        if ground_near:
+            print(self.time, 'ground band reads %.2fm (under %.2fm) - something is standing where '
+                              'the floor should be' % (ground_dist, near_threshold))
+        self.publish('ground_hazard', [ground_hazard, round(ground_valid_frac, 3), ground_dist,
+                                       ground_near])
 
         if self.verbose:
             error_deg = round(math.degrees(self.last_pitch_error_rad), 1) if self.last_pitch_error_rad is not None else None
@@ -1007,6 +1201,7 @@ class ObstacleDetector3DZones(Node):
             # chassis sits level, check whether roll_deg or yaw_deg is the
             # one actually swinging when you tilt the camera nose up/down.
             print(self.time, 'roll_deg', round(math.degrees(self.last_roll), 1),
+                  'roll_corrected_deg', round(math.degrees(self.last_roll - self.roll_offset_rad), 1),
                   'pitch_deg', round(math.degrees(self.smoothed_pitch), 1),
                   'pitch_raw_deg', round(math.degrees(self.last_raw_pitch), 1),
                   'pitch_offset_deg', round(math.degrees(self.pitch_offset_rad), 1),
